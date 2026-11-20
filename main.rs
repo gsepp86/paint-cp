@@ -17,12 +17,16 @@ const MAX_UNDO: usize = 20;
 /// Limite di memoria della cronologia: oltre questo si scartano i passi piu' vecchi.
 const MAX_UNDO_BYTES: usize = 192 * 1024 * 1024;
 const DEFAULT_SIZE: (u32, u32) = (1024, 600);
+/// Spessore dei righelli attorno al foglio (punti schermo).
+const RULER: f32 = 20.0;
+/// Spazio libero oltre il foglio per le maniglie di ridimensionamento.
+const CANVAS_TAIL: f32 = 12.0;
 const WHITE: [u8; 3] = [255, 255, 255];
 const BLACK: [u8; 3] = [0, 0, 0];
 const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
-const APP_VERSION: &str = "1.0";
+const APP_VERSION: &str = "1.1";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 
 const PALETTE: [[u8; 3]; 30] = [
@@ -145,6 +149,23 @@ struct ResizeDialog {
     ratio: f32,
 }
 
+/// Lato del foglio che si sta trascinando.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeHandle {
+    Right,
+    Bottom,
+    Corner,
+}
+
+/// Trascinamento in corso di un margine del foglio (come in Paint).
+struct CanvasResize {
+    handle: ResizeHandle,
+    /// Documento com'era all'inizio del trascinamento.
+    original: DocState,
+    size0: (u32, u32),
+    last: (u32, u32),
+}
+
 /// Un livello dell'immagine: pixel, visibilita' e opacita'.
 #[derive(Clone)]
 struct Layer {
@@ -206,9 +227,11 @@ struct PaintApp {
     show_layers: bool,
     eraser_transparent: bool,
     zoom: f32,
+    show_ruler: bool,
     dark: bool,
 
     stroke: Option<ActiveStroke>,
+    resize_drag: Option<CanvasResize>,
     selection: Option<Selection>,
     text_edit: Option<TextEdit>,
     clipboard: Option<RgbaImage>,
@@ -295,6 +318,50 @@ fn overlay_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
         }
         blend_pixel(dst, x as i32, y as i32, s);
     }
+}
+
+/// Cambia la dimensione del foglio senza deformare il disegno: il contenuto resta
+/// ancorato in alto a sinistra, la parte nuova e' bianca (o trasparente).
+fn resize_canvas_image(img: &RgbaImage, w: u32, h: u32, white: bool) -> RgbaImage {
+    let mut out = if white {
+        RgbaImage::from_pixel(w, h, rgba(WHITE))
+    } else {
+        RgbaImage::new(w, h)
+    };
+    let cw = img.width().min(w);
+    let ch = img.height().min(h);
+    for y in 0..ch {
+        for x in 0..cw {
+            out.put_pixel(x, y, *img.get_pixel(x, y));
+        }
+    }
+    out
+}
+
+/// Passo delle tacche del righello, scelto perche' le etichette non si accavallino.
+fn ruler_step(zoom: f32) -> u32 {
+    let min_px = 56.0 / zoom.max(0.01);
+    const STEPS: [u32; 14] = [
+        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000,
+    ];
+    for s in STEPS {
+        if s as f32 >= min_px {
+            return s;
+        }
+    }
+    10000
+}
+
+/// Icona della finestra, ricavata dal PNG multirisoluzione del progetto.
+fn window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("assets/icon.png"))
+        .ok()?
+        .to_rgba8();
+    Some(egui::IconData {
+        rgba: img.as_raw().clone(),
+        width: img.width(),
+        height: img.height(),
+    })
 }
 
 /// Ritaglia una regione anche se esce dai bordi: le parti fuori restano trasparenti.
@@ -859,8 +926,10 @@ impl PaintApp {
             show_layers: true,
             eraser_transparent: false,
             zoom: 1.0,
+            show_ruler: true,
             dark: false,
             stroke: None,
+            resize_drag: None,
             selection: None,
             text_edit: None,
             clipboard: None,
@@ -1678,6 +1747,10 @@ impl PaintApp {
     }
 
     fn process_canvas_input(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
+        // Mentre si trascina un margine il foglio non deve disegnare.
+        if self.resize_drag.is_some() {
+            return;
+        }
         let zoom = self.zoom;
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let px = pointer.map(|p| {
@@ -2097,6 +2170,7 @@ impl PaintApp {
                             ui.close_menu();
                         }
                         ui.separator();
+                        ui.checkbox(&mut self.show_ruler, "Righello");
                         ui.checkbox(&mut self.show_layers, "Pannello livelli");
                         if ui.checkbox(&mut self.dark, "Tema scuro").changed() {
                             setup_style(ctx, self.dark);
@@ -2466,6 +2540,235 @@ impl PaintApp {
             });
     }
 
+    // ----- righello e margini del foglio ---------------------------------------------
+
+    /// Righelli in pixel sopra e a sinistra del foglio.
+    fn draw_rulers(&self, ui: &egui::Ui, canvas: Rect) {
+        let dark = self.dark;
+        let band = if dark {
+            Color32::from_rgb(48, 48, 48)
+        } else {
+            Color32::from_rgb(249, 249, 249)
+        };
+        let tick = if dark {
+            Color32::from_gray(160)
+        } else {
+            Color32::from_gray(110)
+        };
+        let weak = if dark {
+            Color32::from_gray(92)
+        } else {
+            Color32::from_gray(178)
+        };
+        let ink = if dark {
+            Color32::from_gray(214)
+        } else {
+            Color32::from_gray(64)
+        };
+
+        let top = Rect::from_min_max(
+            pos2(canvas.min.x, canvas.min.y - RULER),
+            pos2(canvas.max.x, canvas.min.y),
+        );
+        let left = Rect::from_min_max(
+            pos2(canvas.min.x - RULER, canvas.min.y),
+            pos2(canvas.min.x, canvas.max.y),
+        );
+        let corner =
+            Rect::from_min_max(pos2(canvas.min.x - RULER, canvas.min.y - RULER), canvas.min);
+
+        let painter = ui.painter();
+        painter.rect_filled(top, 0.0, band);
+        painter.rect_filled(left, 0.0, band);
+        painter.rect_filled(corner, 0.0, band);
+        painter.line_segment(
+            [top.left_bottom(), top.right_bottom()],
+            Stroke::new(1.0_f32, weak),
+        );
+        painter.line_segment(
+            [left.right_top(), left.right_bottom()],
+            Stroke::new(1.0_f32, weak),
+        );
+
+        let step = ruler_step(self.zoom);
+        let minor = if (step as f32 / 5.0) * self.zoom >= 4.0 {
+            (step / 5).max(1)
+        } else {
+            step
+        };
+        let font = egui::FontId::proportional(8.5);
+
+        let pt = painter.with_clip_rect(top);
+        let mut x = 0;
+        while x <= self.width() {
+            let px = canvas.min.x + x as f32 * self.zoom;
+            if x % step == 0 {
+                pt.line_segment(
+                    [pos2(px, top.max.y - 7.0), pos2(px, top.max.y)],
+                    Stroke::new(1.0_f32, tick),
+                );
+                pt.text(
+                    pos2(px + 2.0, top.min.y + 1.0),
+                    Align2::LEFT_TOP,
+                    x.to_string(),
+                    font.clone(),
+                    ink,
+                );
+            } else {
+                pt.line_segment(
+                    [pos2(px, top.max.y - 4.0), pos2(px, top.max.y)],
+                    Stroke::new(1.0_f32, weak),
+                );
+            }
+            x += minor;
+        }
+
+        let pl = painter.with_clip_rect(left);
+        let mut y = 0;
+        while y <= self.height() {
+            let py = canvas.min.y + y as f32 * self.zoom;
+            if y % step == 0 {
+                pl.line_segment(
+                    [pos2(left.max.x - 7.0, py), pos2(left.max.x, py)],
+                    Stroke::new(1.0_f32, tick),
+                );
+                pl.text(
+                    pos2(left.min.x + 1.0, py + 1.0),
+                    Align2::LEFT_TOP,
+                    y.to_string(),
+                    font.clone(),
+                    ink,
+                );
+            } else {
+                pl.line_segment(
+                    [pos2(left.max.x - 4.0, py), pos2(left.max.x, py)],
+                    Stroke::new(1.0_f32, weak),
+                );
+            }
+            y += minor;
+        }
+
+        // Posizione del cursore evidenziata sui due righelli.
+        if let Some((cx, cy)) = self.cursor_px {
+            let px = canvas.min.x + cx as f32 * self.zoom;
+            let py = canvas.min.y + cy as f32 * self.zoom;
+            pt.line_segment(
+                [pos2(px, top.min.y), pos2(px, top.max.y)],
+                Stroke::new(1.0_f32, ACCENT),
+            );
+            pl.line_segment(
+                [pos2(left.min.x, py), pos2(left.max.x, py)],
+                Stroke::new(1.0_f32, ACCENT),
+            );
+        }
+    }
+
+    /// Margini trascinabili: cambiano le dimensioni del foglio come in Paint.
+    fn canvas_resize_handles(&mut self, ui: &egui::Ui, canvas: Rect) {
+        let grip = 11.0;
+        let zones = [
+            (
+                ResizeHandle::Right,
+                Rect::from_min_max(
+                    pos2(canvas.max.x - grip / 2.0, canvas.min.y + 10.0),
+                    pos2(canvas.max.x + grip / 2.0, canvas.max.y - grip),
+                ),
+                CursorIcon::ResizeHorizontal,
+            ),
+            (
+                ResizeHandle::Bottom,
+                Rect::from_min_max(
+                    pos2(canvas.min.x + 10.0, canvas.max.y - grip / 2.0),
+                    pos2(canvas.max.x - grip, canvas.max.y + grip / 2.0),
+                ),
+                CursorIcon::ResizeVertical,
+            ),
+            (
+                ResizeHandle::Corner,
+                Rect::from_center_size(canvas.max, Vec2::splat(grip)),
+                CursorIcon::ResizeNwSe,
+            ),
+        ];
+
+        for (handle, zone, cursor) in zones {
+            let id = ui.id().with(("canvas_margin", handle as u8));
+            let resp = ui.interact(zone, id, Sense::drag());
+            if resp.hovered() || self.resize_drag.as_ref().map(|d| d.handle) == Some(handle) {
+                ui.ctx().set_cursor_icon(cursor);
+            }
+            if resp.drag_started() {
+                self.begin_canvas_resize(handle);
+            }
+            if resp.dragged() {
+                if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                    self.drag_canvas_resize(p, canvas.min);
+                }
+            }
+            if resp.drag_stopped() {
+                self.end_canvas_resize();
+            }
+        }
+    }
+
+    fn begin_canvas_resize(&mut self, handle: ResizeHandle) {
+        self.commit_text();
+        self.selection = None;
+        self.push_undo();
+        let original = self.undo.last().cloned().unwrap_or_else(|| self.snapshot());
+        let size0 = (self.width(), self.height());
+        self.resize_drag = Some(CanvasResize {
+            handle,
+            original,
+            size0,
+            last: size0,
+        });
+        self.status = String::from("Trascina il margine per cambiare il foglio");
+    }
+
+    fn drag_canvas_resize(&mut self, pointer: Pos2, origin: Pos2) {
+        let Some(drag) = self.resize_drag.as_ref() else {
+            return;
+        };
+        let zoom = self.zoom.max(0.01);
+        let px = ((pointer.x - origin.x) / zoom).round() as i32;
+        let py = ((pointer.y - origin.y) / zoom).round() as i32;
+        let (mut w, mut h) = drag.size0;
+        if matches!(drag.handle, ResizeHandle::Right | ResizeHandle::Corner) {
+            w = px.clamp(1, 8192) as u32;
+        }
+        if matches!(drag.handle, ResizeHandle::Bottom | ResizeHandle::Corner) {
+            h = py.clamp(1, 8192) as u32;
+        }
+        if (w, h) == drag.last {
+            return;
+        }
+        // Si riparte sempre dal documento originale del trascinamento,
+        // cosi' allargando e restringendo non si perdono pixel.
+        let original = drag.original.layers.clone();
+        self.layers = original;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.image = resize_canvas_image(&layer.image, w, h, i == 0);
+        }
+        if let Some(drag) = self.resize_drag.as_mut() {
+            drag.last = (w, h);
+        }
+        self.dirty = true;
+        self.status = format!("Foglio: {w} x {h} px");
+    }
+
+    fn end_canvas_resize(&mut self) {
+        let Some(drag) = self.resize_drag.take() else {
+            return;
+        };
+        if drag.last == drag.size0 {
+            // Nessuna modifica: togliamo il passo inutile dalla cronologia.
+            self.undo.pop();
+        } else {
+            self.modified = true;
+            self.status = format!("Foglio: {} x {} px", drag.last.0, drag.last.1);
+        }
+    }
+
     // ----- interfaccia: tela ---------------------------------------------------------
 
     fn canvas_panel(&mut self, ctx: &egui::Context) {
@@ -2491,9 +2794,16 @@ impl PaintApp {
                 .auto_shrink([false, false])
                 .drag_to_scroll(false)
                 .show(ui, |ui| {
-                    let size = Vec2::new(self.width() as f32, self.height() as f32) * self.zoom;
-                    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                    let canvas_size =
+                        Vec2::new(self.width() as f32, self.height() as f32) * self.zoom;
+                    let front = if self.show_ruler { RULER } else { 0.0 };
+                    let total = canvas_size + vec2(front + CANVAS_TAIL, front + CANVAS_TAIL);
+                    let (area, _) = ui.allocate_exact_size(total, Sense::hover());
+                    let rect = Rect::from_min_size(area.min + vec2(front, front), canvas_size);
+                    let response =
+                        ui.interact(rect, ui.id().with("canvas"), Sense::click_and_drag());
 
+                    self.canvas_resize_handles(ui, rect);
                     self.process_canvas_input(ui, &response, rect);
 
                     if self.dirty {
@@ -2519,6 +2829,9 @@ impl PaintApp {
                     }
 
                     self.draw_overlays(ui, &response, rect);
+                    if self.show_ruler {
+                        self.draw_rulers(ui, rect);
+                    }
                 });
         });
     }
@@ -2556,6 +2869,18 @@ impl PaintApp {
             0.0,
             Stroke::new(1.0_f32, Color32::from_black_alpha(90)),
         );
+
+        // Maniglie sui margini del foglio (come in Paint).
+        let sq = 8.0;
+        for c in [
+            pos2(rect.max.x, rect.center().y),
+            pos2(rect.center().x, rect.max.y),
+            rect.max,
+        ] {
+            let hr = Rect::from_center_size(c, Vec2::splat(sq));
+            painter.rect_filled(hr, 1.0, Color32::WHITE);
+            painter.rect_stroke(hr, 1.0, Stroke::new(1.0_f32, Color32::from_gray(70)));
+        }
 
         if let Some(sel) = &self.selection {
             let min = rect.min + vec2(sel.x as f32, sel.y as f32) * self.zoom;
@@ -2814,11 +3139,15 @@ impl eframe::App for PaintApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([1040.0, 520.0])
+        .with_title(format!("Senza titolo - {}", APP_NAME));
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1040.0, 520.0])
-            .with_title(format!("Senza titolo - {}", APP_NAME)),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

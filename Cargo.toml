@@ -1,12 +1,16 @@
 [package]
 name = "paint_cp"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Paint CP - app semplice per piccole modifiche alle foto in stile Paint"
 
 [[bin]]
 name = "paint_cp"
 path = "main.rs"
+
+[target.'cfg(windows)'.build-dependencies]
+# Icona e risorse dell'eseguibile (solo su Windows).
+embed-resource = "2"
 
 [dependencies]
 eframe = "0.29"

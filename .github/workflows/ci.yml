@@ -37,11 +37,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release
+      - name: Crea l'installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\paint_cp.exe dist\paint_cp.exe
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "installer\paint_cp.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Carica artefatto
         uses: actions/upload-artifact@v4
         with:
           name: paint-cp-windows
-          path: target/release/*.exe
+          path: dist/*.exe
 
   release:
     name: Pubblica release
