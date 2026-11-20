@@ -26,9 +26,7 @@ const BLACK: [u8; 3] = [0, 0, 0];
 const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
-const APP_VERSION: &str = "1.5";
-/// Durata della dissolvenza con cui compare la finestra all'avvio (secondi).
-const FADE_IN_SECS: f32 = 0.35;
+const APP_VERSION: &str = "1.2";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
 
@@ -339,10 +337,6 @@ struct PaintApp {
     dark: bool,
     /// Apri la finestra sempre massimizzata (Impostazioni).
     maximized: bool,
-    /// Primo frame: controlla che la finestra sia davvero massimizzata.
-    first_frame: bool,
-    /// Istante in cui e' comparso il primo frame: regola la dissolvenza iniziale.
-    launch: std::time::Instant,
     /// Lingua dell'interfaccia (Impostazioni).
     lang: Lang,
 
@@ -1052,8 +1046,6 @@ impl PaintApp {
             show_ruler: true,
             dark: settings.dark,
             maximized: settings.maximized,
-            first_frame: true,
-            launch: std::time::Instant::now(),
             lang,
             stroke: None,
             resize_drag: None,
@@ -3609,29 +3601,6 @@ impl PaintApp {
         }
     }
 
-    /// Dissolvenza iniziale: copre la finestra con il colore di sfondo e lo fa
-    /// sparire in pochi decimi di secondo. Serve a nascondere eventuali
-    /// ridisegni o passaggi di dimensione mentre la finestra si apre.
-    fn fade_in(&mut self, ctx: &egui::Context) {
-        let elapsed = self.launch.elapsed().as_secs_f32();
-        if elapsed >= FADE_IN_SECS {
-            return;
-        }
-        let t = (elapsed / FADE_IN_SECS).clamp(0.0, 1.0);
-        // Curva morbida (smoothstep): parte e finisce dolcemente.
-        let covered = 1.0 - t * t * (3.0 - 2.0 * t);
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Tooltip,
-            egui::Id::new("dissolvenza_iniziale"),
-        ));
-        painter.rect_filled(
-            ctx.screen_rect(),
-            0.0,
-            ctx.style().visuals.panel_fill.gamma_multiply(covered),
-        );
-        ctx.request_repaint();
-    }
-
     fn update_title(&mut self, ctx: &egui::Context) {
         let name = self
             .file_path
@@ -3654,15 +3623,6 @@ impl PaintApp {
 
 impl eframe::App for PaintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // La finestra nasce gia' massimizzata (vedi main). Qui solo una rete di
-        // sicurezza: se il sistema non l'ha applicata, la chiediamo al primo frame.
-        if self.first_frame {
-            self.first_frame = false;
-            self.launch = std::time::Instant::now();
-            if self.maximized && !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            }
-        }
         self.handle_shortcuts(ctx);
         self.menu_bar(ctx);
         self.toolbar(ctx);
@@ -3682,16 +3642,11 @@ impl eframe::App for PaintApp {
         self.layers_panel(ctx);
         self.canvas_panel(ctx);
         self.update_title(ctx);
-        self.fade_in(ctx);
     }
 }
 
 fn main() -> eframe::Result<()> {
     let settings = Settings::load();
-    // La massimizzazione viene chiesta direttamente al sistema operativo alla
-    // creazione della finestra, che eframe tiene nascosta finche' non ha
-    // disegnato il primo frame: si apre cosi' gia' a schermo pieno, senza il
-    // passaggio visibile da finestra normale a massimizzata.
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([1040.0, 520.0])
