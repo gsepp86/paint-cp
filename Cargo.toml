@@ -8,8 +8,8 @@ description = "Paint CP - app semplice per piccole modifiche alle foto in stile 
 name = "paint_cp"
 path = "main.rs"
 
-[target.'cfg(windows)'.build-dependencies]
-# Icona e risorse dell'eseguibile (solo su Windows).
+[build-dependencies]
+# Icona e risorse dell'eseguibile (usato solo quando si compila per Windows).
 embed-resource = "2"
 
 [dependencies]
