@@ -26,7 +26,7 @@ const BLACK: [u8; 3] = [0, 0, 0];
 const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
-const APP_VERSION: &str = "1.2";
+const APP_VERSION: &str = "1.3";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
 
