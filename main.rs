@@ -13,7 +13,9 @@ use eframe::egui::{
 };
 use image::{imageops, DynamicImage, Rgba, RgbaImage};
 
-const MAX_UNDO: usize = 30;
+const MAX_UNDO: usize = 20;
+/// Limite di memoria della cronologia: oltre questo si scartano i passi piu' vecchi.
+const MAX_UNDO_BYTES: usize = 192 * 1024 * 1024;
 const DEFAULT_SIZE: (u32, u32) = (1024, 600);
 const WHITE: [u8; 3] = [255, 255, 255];
 const BLACK: [u8; 3] = [0, 0, 0];
@@ -65,6 +67,7 @@ enum Tool {
     Select,
     Pencil,
     Brush,
+    Smudge,
     Eraser,
     Spray,
     Fill,
@@ -75,10 +78,11 @@ enum Tool {
     Ellipse,
 }
 
-const MAIN_TOOLS: [(Tool, &str); 8] = [
+const MAIN_TOOLS: [(Tool, &str); 9] = [
     (Tool::Select, "Seleziona (rettangolo)"),
     (Tool::Pencil, "Matita"),
     (Tool::Brush, "Pennello"),
+    (Tool::Smudge, "Fluidifica (sfuma e trascina i colori)"),
     (Tool::Eraser, "Gomma"),
     (Tool::Spray, "Spray"),
     (Tool::Fill, "Secchiello"),
@@ -141,21 +145,65 @@ struct ResizeDialog {
     ratio: f32,
 }
 
+/// Un livello dell'immagine: pixel, visibilita' e opacita'.
+#[derive(Clone)]
+struct Layer {
+    name: String,
+    image: RgbaImage,
+    visible: bool,
+    opacity: f32,
+}
+
+impl Layer {
+    fn background(w: u32, h: u32) -> Self {
+        Self {
+            name: String::from("Sfondo"),
+            image: RgbaImage::from_pixel(w.max(1), h.max(1), rgba(WHITE)),
+            visible: true,
+            opacity: 1.0,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.image.as_raw().len() + 64
+    }
+}
+
+/// Stato completo del documento: serve per annulla / ripeti.
+#[derive(Clone)]
+struct DocState {
+    layers: Vec<Layer>,
+    active: usize,
+}
+
+impl DocState {
+    fn bytes(&self) -> usize {
+        self.layers.iter().map(Layer::bytes).sum::<usize>() + 32
+    }
+}
+
 struct PaintApp {
-    canvas: RgbaImage,
+    /// Livelli del documento, dal piu' basso al piu' alto.
+    layers: Vec<Layer>,
+    /// Indice del livello su cui si sta disegnando.
+    active: usize,
+    /// Immagine composta pronta per lo schermo (aggiornata solo quando serve).
+    display: RgbaImage,
     texture: Option<TextureHandle>,
     dirty: bool,
     has_alpha: bool,
 
-    undo: Vec<RgbaImage>,
-    redo: Vec<RgbaImage>,
+    undo: Vec<DocState>,
+    redo: Vec<DocState>,
 
     tool: Tool,
     primary: [u8; 3],
     secondary: [u8; 3],
     size: u32,
     text_size: u32,
+    smudge: f32,
     shape_mode: ShapeMode,
+    show_layers: bool,
     eraser_transparent: bool,
     zoom: f32,
     dark: bool,
@@ -227,6 +275,86 @@ fn overlay(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32) {
             }
             let s = *src.get_pixel(sx as u32, sy as u32);
             blend_pixel(dst, dx, dy, s);
+        }
+    }
+}
+
+/// Come `overlay`, ma con l'opacita' del livello applicata ai pixel sorgente.
+fn overlay_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
+    let op = opacity.clamp(0.0, 1.0);
+    if op <= 0.0 {
+        return;
+    }
+    for (x, y, p) in src.enumerate_pixels() {
+        if p.0[3] == 0 {
+            continue;
+        }
+        let mut s = *p;
+        if op < 1.0 {
+            s.0[3] = (s.0[3] as f32 * op).round() as u8;
+        }
+        blend_pixel(dst, x as i32, y as i32, s);
+    }
+}
+
+/// Ritaglia una regione anche se esce dai bordi: le parti fuori restano trasparenti.
+fn crop_clamped(img: &RgbaImage, x: i32, y: i32, w: i32, h: i32) -> RgbaImage {
+    let (w, h) = (w.max(1), h.max(1));
+    let mut out = RgbaImage::new(w as u32, h as u32);
+    for sy in 0..h {
+        for sx in 0..w {
+            let (ix, iy) = (x + sx, y + sy);
+            if ix >= 0 && iy >= 0 && (ix as u32) < img.width() && (iy as u32) < img.height() {
+                out.put_pixel(sx as u32, sy as u32, *img.get_pixel(ix as u32, iy as u32));
+            }
+        }
+    }
+    out
+}
+
+/// Fluidifica: trascina e sfuma i colori lungo il tratto (come il dito sul colore fresco).
+fn smudge(img: &mut RgbaImage, from: (i32, i32), to: (i32, i32), size: u32, strength: f32) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let r = (size as f32 / 2.0).max(1.0);
+    let ri = r.ceil() as i32;
+    let side = (2 * ri + 1) as usize;
+    // Campioniamo prima la zona spostata, cosi' il trascinamento non si "mangia" da solo.
+    let mut sample: Vec<Rgba<u8>> = Vec::with_capacity(side * side);
+    for oy in -ri..=ri {
+        for ox in -ri..=ri {
+            let (sx, sy) = (to.0 + ox - dx, to.1 + oy - dy);
+            if sx >= 0 && sy >= 0 && (sx as u32) < img.width() && (sy as u32) < img.height() {
+                sample.push(*img.get_pixel(sx as u32, sy as u32));
+            } else {
+                sample.push(Rgba([0, 0, 0, 0]));
+            }
+        }
+    }
+    for (i, oy) in (-ri..=ri).enumerate() {
+        for (j, ox) in (-ri..=ri).enumerate() {
+            let dist = ((ox * ox + oy * oy) as f32).sqrt();
+            if dist > r {
+                continue;
+            }
+            let (x, y) = (to.0 + ox, to.1 + oy);
+            if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
+                continue;
+            }
+            let t = strength * (1.0 - dist / r);
+            if t <= 0.0 {
+                continue;
+            }
+            let s = sample[i * side + j];
+            let dst = *img.get_pixel(x as u32, y as u32);
+            let mut out = dst;
+            for k in 0..4 {
+                let v = dst.0[k] as f32 * (1.0 - t) + s.0[k] as f32 * t;
+                out.0[k] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            img.put_pixel(x as u32, y as u32, out);
         }
     }
 }
@@ -424,15 +552,22 @@ fn flatten_on_white(img: &mut RgbaImage) {
         if a == 255 {
             continue;
         }
-        for i in 0..3 {
-            p.0[i] = ((p.0[i] as u32 * a + 255 * (255 - a)) / 255) as u8;
+        for c in p.0[..3].iter_mut() {
+            *c = ((*c as u32 * a + 255 * (255 - a)) / 255) as u8;
         }
         p.0[3] = 255;
     }
 }
 
 /// Disegna il testo (con antialiasing) direttamente sui pixel della tela.
-fn draw_text(img: &mut RgbaImage, font: &FontArc, text: &str, pos: (i32, i32), px: f32, color: [u8; 3]) {
+fn draw_text(
+    img: &mut RgbaImage,
+    font: &FontArc,
+    text: &str,
+    pos: (i32, i32),
+    px: f32,
+    color: [u8; 3],
+) {
     let scale = PxScale::from(px);
     let scaled = font.as_scaled(scale);
     let line_h = scaled.height() + scaled.line_gap();
@@ -448,10 +583,8 @@ fn draw_text(img: &mut RgbaImage, font: &FontArc, text: &str, pos: (i32, i32), p
             continue;
         }
         let id = scaled.glyph_id(ch);
-        let glyph = id.with_scale_and_position(
-            scale,
-            ab_glyph::point(pos.0 as f32 + cx, pos.1 as f32 + cy),
-        );
+        let glyph = id
+            .with_scale_and_position(scale, ab_glyph::point(pos.0 as f32 + cx, pos.1 as f32 + cy));
         cx += scaled.h_advance(id);
         if let Some(outlined) = font.outline_glyph(glyph) {
             let b = outlined.px_bounds();
@@ -516,19 +649,19 @@ fn setup_style(ctx: &egui::Context, dark: bool) {
     v.window_rounding = Rounding::same(10.0);
     v.menu_rounding = Rounding::same(8.0);
     v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     if dark {
         v.panel_fill = Color32::from_rgb(32, 32, 32);
         v.window_fill = Color32::from_rgb(44, 44, 44);
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(58, 66, 78);
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     } else {
         v.panel_fill = Color32::from_rgb(243, 243, 243);
         v.window_fill = Color32::WHITE;
         v.widgets.inactive.weak_bg_fill = Color32::WHITE;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(214));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_gray(214));
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(232, 240, 250);
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     }
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
@@ -540,7 +673,7 @@ fn setup_style(ctx: &egui::Context, dark: bool) {
 
 /// Bordo tratteggiato (le "formiche in marcia" della selezione).
 fn dashed_rect(painter: &egui::Painter, r: Rect, base: Color32, dash: Color32) {
-    painter.rect_stroke(r, 0.0, Stroke::new(1.0, base));
+    painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, base));
     let pts = [
         r.left_top(),
         r.right_top(),
@@ -548,7 +681,7 @@ fn dashed_rect(painter: &egui::Painter, r: Rect, base: Color32, dash: Color32) {
         r.left_bottom(),
         r.left_top(),
     ];
-    let stroke = Stroke::new(1.0, dash);
+    let stroke = Stroke::new(1.0_f32, dash);
     for w in pts.windows(2) {
         let (a, b) = (w[0], w[1]);
         let len = (b - a).length();
@@ -587,6 +720,12 @@ fn paint_tool_icon(p: &egui::Painter, r: Rect, tool: Tool, col: Color32) {
             p.line_segment([pt(-1.0, 1.0), pt(8.0, -8.0)], Stroke::new(3.0 * u, col));
             p.circle_filled(pt(-5.0, 5.0), 4.0 * u, col);
         }
+        Tool::Smudge => {
+            // Un dito che trascina il colore.
+            p.circle_filled(pt(-2.0, 2.0), 4.5 * u, col);
+            p.line_segment([pt(0.0, 0.0), pt(7.0, -7.0)], Stroke::new(1.6 * u, col));
+            p.circle_stroke(pt(7.0, -7.0), 2.0 * u, thin);
+        }
         Tool::Eraser => {
             p.line_segment([pt(-5.0, 4.0), pt(3.0, -4.0)], Stroke::new(9.0 * u, col));
             p.line_segment([pt(-9.0, 9.0), pt(9.0, 9.0)], thin);
@@ -608,7 +747,11 @@ fn paint_tool_icon(p: &egui::Painter, r: Rect, tool: Tool, col: Color32) {
             }
         }
         Tool::Fill => {
-            p.rect_stroke(Rect::from_two_pos(pt(-8.0, -2.0), pt(2.0, 8.0)), 2.0 * u, thin);
+            p.rect_stroke(
+                Rect::from_two_pos(pt(-8.0, -2.0), pt(2.0, 8.0)),
+                2.0 * u,
+                thin,
+            );
             p.line_segment([pt(-3.0, -2.0), pt(3.0, -8.0)], thin);
             p.circle_filled(pt(7.0, 5.0), 2.2 * u, col);
         }
@@ -625,12 +768,16 @@ fn paint_tool_icon(p: &egui::Painter, r: Rect, tool: Tool, col: Color32) {
                 col,
             );
         }
-        Tool::Line => p.line_segment([pt(-8.0, 8.0), pt(8.0, -8.0)], medium),
-        Tool::Rectangle => p.rect_stroke(
-            Rect::from_two_pos(pt(-9.0, -6.0), pt(9.0, 6.0)),
-            1.0,
-            medium,
-        ),
+        Tool::Line => {
+            p.line_segment([pt(-8.0, 8.0), pt(8.0, -8.0)], medium);
+        }
+        Tool::Rectangle => {
+            p.rect_stroke(
+                Rect::from_two_pos(pt(-9.0, -6.0), pt(9.0, 6.0)),
+                1.0,
+                medium,
+            );
+        }
         Tool::Ellipse => {
             let mut prev = pt(9.0, 0.0);
             for i in 1..=24 {
@@ -643,7 +790,13 @@ fn paint_tool_icon(p: &egui::Painter, r: Rect, tool: Tool, col: Color32) {
     }
 }
 
-fn tool_button(ui: &mut egui::Ui, selected: bool, tool: Tool, label: &str, size: f32) -> egui::Response {
+fn tool_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    tool: Tool,
+    label: &str,
+    size: f32,
+) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let hover_fill = ui.visuals().widgets.hovered.weak_bg_fill;
     let text_col = ui.visuals().text_color();
@@ -655,7 +808,8 @@ fn tool_button(ui: &mut egui::Ui, selected: bool, tool: Tool, label: &str, size:
         };
         ui.painter().rect_filled(rect, 6.0, fill);
         if selected {
-            ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, ACCENT));
+            ui.painter()
+                .rect_stroke(rect, 6.0, Stroke::new(1.0_f32, ACCENT));
         }
     }
     let col = if selected { ACCENT } else { text_col };
@@ -687,7 +841,9 @@ impl PaintApp {
     fn new(ctx: &egui::Context) -> Self {
         setup_style(ctx, false);
         Self {
-            canvas: RgbaImage::from_pixel(DEFAULT_SIZE.0, DEFAULT_SIZE.1, rgba(WHITE)),
+            layers: vec![Layer::background(DEFAULT_SIZE.0, DEFAULT_SIZE.1)],
+            active: 0,
+            display: RgbaImage::from_pixel(DEFAULT_SIZE.0, DEFAULT_SIZE.1, rgba(WHITE)),
             texture: None,
             dirty: true,
             has_alpha: false,
@@ -698,7 +854,9 @@ impl PaintApp {
             secondary: WHITE,
             size: 6,
             text_size: 32,
+            smudge: 0.5,
             shape_mode: ShapeMode::Outline,
+            show_layers: true,
             eraser_transparent: false,
             zoom: 1.0,
             dark: false,
@@ -717,6 +875,29 @@ impl PaintApp {
             last_title: String::new(),
             rng: 0x2545_F491_4F6C_DD1D,
         }
+    }
+
+    // ----- dimensioni e livello attivo ------------------------------------
+
+    fn width(&self) -> u32 {
+        self.layers.first().map(|l| l.image.width()).unwrap_or(1)
+    }
+
+    fn height(&self) -> u32 {
+        self.layers.first().map(|l| l.image.height()).unwrap_or(1)
+    }
+
+    /// Pixel del livello attivo: e' qui che disegnano tutti gli strumenti.
+    fn canvas(&self) -> &RgbaImage {
+        &self.layers[self.active].image
+    }
+
+    fn canvas_mut(&mut self) -> &mut RgbaImage {
+        &mut self.layers[self.active].image
+    }
+
+    fn set_canvas(&mut self, img: RgbaImage) {
+        self.layers[self.active].image = img;
     }
 
     // ----- colori e dimensioni -------------------------------------------
@@ -752,43 +933,70 @@ impl PaintApp {
 
     fn clamp_to_canvas(&self, p: (i32, i32)) -> (i32, i32) {
         (
-            p.0.clamp(0, self.canvas.width() as i32 - 1),
-            p.1.clamp(0, self.canvas.height() as i32 - 1),
+            p.0.clamp(0, self.canvas().width() as i32 - 1),
+            p.1.clamp(0, self.canvas().height() as i32 - 1),
         )
     }
 
     // ----- cronologia (annulla / ripeti) ----------------------------------
 
+    fn snapshot(&self) -> DocState {
+        DocState {
+            layers: self.layers.clone(),
+            active: self.active,
+        }
+    }
+
+    fn restore(&mut self, state: DocState) {
+        self.layers = state.layers;
+        if self.layers.is_empty() {
+            self.layers
+                .push(Layer::background(self.width(), self.height()));
+        }
+        self.active = state.active.min(self.layers.len() - 1);
+        self.stroke = None;
+        self.selection = None;
+        self.dirty = true;
+    }
+
+    /// Scarta i passi piu' vecchi quando la cronologia diventa troppo pesante.
+    fn trim_history(&mut self) {
+        let mut total: usize = self
+            .undo
+            .iter()
+            .chain(self.redo.iter())
+            .map(DocState::bytes)
+            .sum();
+        while self.undo.len() > 5 && (self.undo.len() > MAX_UNDO || total > MAX_UNDO_BYTES) {
+            let removed = self.undo.remove(0);
+            total = total.saturating_sub(removed.bytes());
+        }
+    }
+
     fn push_undo(&mut self) {
         self.commit_text();
-        if self.undo.len() >= MAX_UNDO {
-            self.undo.remove(0);
-        }
-        self.undo.push(self.canvas.clone());
+        self.undo.push(self.snapshot());
         self.redo.clear();
+        self.trim_history();
         self.modified = true;
     }
 
     fn do_undo(&mut self) {
         self.commit_text();
-        self.stroke = None;
-        self.selection = None;
         if let Some(prev) = self.undo.pop() {
-            let current = std::mem::replace(&mut self.canvas, prev);
+            let current = self.snapshot();
+            self.restore(prev);
             self.redo.push(current);
-            self.dirty = true;
             self.modified = true;
         }
     }
 
     fn do_redo(&mut self) {
         self.commit_text();
-        self.stroke = None;
-        self.selection = None;
         if let Some(next) = self.redo.pop() {
-            let current = std::mem::replace(&mut self.canvas, next);
+            let current = self.snapshot();
+            self.restore(next);
             self.undo.push(current);
-            self.dirty = true;
             self.modified = true;
         }
     }
@@ -796,9 +1004,11 @@ impl PaintApp {
     // ----- operazioni sull'immagine ---------------------------------------
 
     fn new_image(&mut self, w: u32, h: u32) {
+        self.commit_text();
         self.push_undo();
         self.selection = None;
-        self.canvas = RgbaImage::from_pixel(w.max(1), h.max(1), rgba(WHITE));
+        self.layers = vec![Layer::background(w, h)];
+        self.active = 0;
         self.has_alpha = false;
         self.file_path = None;
         self.modified = false;
@@ -810,16 +1020,19 @@ impl PaintApp {
         self.push_undo();
         self.selection = None;
         let c = rgba(self.secondary);
-        for p in self.canvas.pixels_mut() {
+        for p in self.canvas_mut().pixels_mut() {
             *p = c;
         }
         self.dirty = true;
+        self.status = String::from("Livello svuotato");
     }
 
-    fn transform(&mut self, f: impl FnOnce(&RgbaImage) -> RgbaImage, msg: &str) {
+    fn transform(&mut self, f: impl Fn(&RgbaImage) -> RgbaImage, msg: &str) {
         self.push_undo();
         self.selection = None;
-        self.canvas = f(&self.canvas);
+        for layer in &mut self.layers {
+            layer.image = f(&layer.image);
+        }
         self.dirty = true;
         self.status = msg.to_string();
     }
@@ -827,9 +1040,9 @@ impl PaintApp {
     fn invert_colors(&mut self) {
         self.push_undo();
         self.selection = None;
-        for p in self.canvas.pixels_mut() {
-            for i in 0..3 {
-                p.0[i] = 255 - p.0[i];
+        for p in self.canvas_mut().pixels_mut() {
+            for c in p.0[..3].iter_mut() {
+                *c = 255 - *c;
             }
         }
         self.dirty = true;
@@ -837,11 +1050,127 @@ impl PaintApp {
     }
 
     fn resize_image(&mut self, w: u32, h: u32) {
+        let (w, h) = (w.max(1), h.max(1));
         self.push_undo();
         self.selection = None;
-        self.canvas = imageops::resize(&self.canvas, w.max(1), h.max(1), imageops::FilterType::Lanczos3);
+        for layer in &mut self.layers {
+            layer.image = imageops::resize(&layer.image, w, h, imageops::FilterType::Lanczos3);
+        }
         self.dirty = true;
         self.status = format!("Ridimensionata a {} x {}", w, h);
+    }
+
+    // ----- livelli ---------------------------------------------------------
+
+    /// Unisce tutti i livelli visibili in una sola immagine.
+    fn composite(&self) -> RgbaImage {
+        let mut out = RgbaImage::new(self.width(), self.height());
+        for layer in &self.layers {
+            if !layer.visible {
+                continue;
+            }
+            overlay_with_opacity(&mut out, &layer.image, layer.opacity);
+        }
+        out
+    }
+
+    fn add_layer(&mut self) {
+        self.commit_text();
+        self.push_undo();
+        let (w, h) = (self.width(), self.height());
+        let name = format!("Livello {}", self.layers.len() + 1);
+        self.layers.insert(
+            self.active + 1,
+            Layer {
+                name,
+                image: RgbaImage::new(w, h),
+                visible: true,
+                opacity: 1.0,
+            },
+        );
+        self.active += 1;
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Nuovo livello trasparente");
+    }
+
+    fn duplicate_layer(&mut self) {
+        self.commit_text();
+        self.push_undo();
+        let mut copy = self.layers[self.active].clone();
+        copy.name = format!("{} copia", copy.name);
+        self.layers.insert(self.active + 1, copy);
+        self.active += 1;
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Livello duplicato");
+    }
+
+    fn delete_layer(&mut self) {
+        if self.layers.len() <= 1 {
+            self.status = String::from("Serve almeno un livello");
+            return;
+        }
+        self.commit_text();
+        self.push_undo();
+        self.layers.remove(self.active);
+        self.active = self.active.min(self.layers.len() - 1);
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Livello eliminato");
+    }
+
+    fn move_layer(&mut self, up: bool) {
+        let other = if up {
+            if self.active + 1 >= self.layers.len() {
+                return;
+            }
+            self.active + 1
+        } else {
+            match self.active.checked_sub(1) {
+                Some(i) => i,
+                None => return,
+            }
+        };
+        self.commit_text();
+        self.push_undo();
+        self.layers.swap(self.active, other);
+        self.active = other;
+        self.selection = None;
+        self.dirty = true;
+    }
+
+    fn merge_down(&mut self) {
+        if self.active == 0 {
+            self.status = String::from("Nessun livello sotto da unire");
+            return;
+        }
+        self.commit_text();
+        self.push_undo();
+        let upper = self.layers.remove(self.active);
+        self.active -= 1;
+        let target = &mut self.layers[self.active];
+        overlay_with_opacity(&mut target.image, &upper.image, upper.opacity);
+        target.opacity = 1.0;
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Livello unito a quello sotto");
+    }
+
+    fn flatten_layers(&mut self) {
+        self.commit_text();
+        self.push_undo();
+        let image = self.composite();
+        self.layers = vec![Layer {
+            name: String::from("Sfondo"),
+            image,
+            visible: true,
+            opacity: 1.0,
+        }];
+        self.active = 0;
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Livelli appiattiti");
     }
 
     // ----- selezione e appunti ------------------------------------------------
@@ -850,16 +1179,7 @@ impl PaintApp {
         let sel = self.selection.as_ref()?;
         match &sel.floating {
             Some(f) => Some(f.content.clone()),
-            None => Some(
-                imageops::crop_imm(
-                    &self.canvas,
-                    sel.x as u32,
-                    sel.y as u32,
-                    sel.w as u32,
-                    sel.h as u32,
-                )
-                .to_image(),
-            ),
+            None => Some(crop_clamped(self.canvas(), sel.x, sel.y, sel.w, sel.h)),
         }
     }
 
@@ -889,15 +1209,19 @@ impl PaintApp {
         };
         self.push_undo();
         if is_floating {
-            if let Some(Selection {
-                floating: Some(f), ..
-            }) = &self.selection
-            {
-                self.canvas.clone_from(&f.base);
+            let base = match &self.selection {
+                Some(Selection {
+                    floating: Some(f), ..
+                }) => Some(f.base.clone()),
+                _ => None,
+            };
+            if let Some(base) = base {
+                self.set_canvas(base);
             }
         } else if let Some(sel) = &self.selection {
+            let (x, y, w, h) = (sel.x, sel.y, sel.w, sel.h);
             let c = rgba(self.secondary);
-            fill_rect(&mut self.canvas, sel.x, sel.y, sel.w, sel.h, c);
+            fill_rect(self.canvas_mut(), x, y, w, h, c);
         }
         self.selection = None;
         self.dirty = true;
@@ -923,8 +1247,8 @@ impl PaintApp {
             return;
         };
         self.push_undo();
-        let base = self.canvas.clone();
-        overlay(&mut self.canvas, &img, 0, 0);
+        let base = self.canvas().clone();
+        overlay(self.canvas_mut(), &img, 0, 0);
         self.selection = Some(Selection {
             x: 0,
             y: 0,
@@ -943,57 +1267,67 @@ impl PaintApp {
         self.selection = Some(Selection {
             x: 0,
             y: 0,
-            w: self.canvas.width() as i32,
-            h: self.canvas.height() as i32,
+            w: self.canvas().width() as i32,
+            h: self.canvas().height() as i32,
             floating: None,
         });
     }
 
     fn crop_to_selection(&mut self) {
-        if let Some(img) = self.selection_image() {
-            self.push_undo();
-            self.canvas = img;
-            self.selection = None;
-            self.dirty = true;
-            self.status = String::from("Immagine ritagliata");
+        let Some(sel) = self.selection.as_ref() else {
+            self.status = String::from("Nessuna selezione");
+            return;
+        };
+        let (x, y, w, h) = (sel.x, sel.y, sel.w, sel.h);
+        self.commit_text();
+        self.push_undo();
+        for layer in &mut self.layers {
+            layer.image = crop_clamped(&layer.image, x, y, w, h);
+        }
+        self.selection = None;
+        self.dirty = true;
+        self.status = String::from("Immagine ritagliata");
+    }
+
+    /// Solleva il contenuto della selezione: viene tolto dal livello e tenuto a parte.
+    fn lift_selection(&mut self) {
+        let (x, y, w, h) = match self.selection.as_ref() {
+            Some(sel) => (sel.x, sel.y, sel.w, sel.h),
+            None => return,
+        };
+        self.push_undo();
+        let content = crop_clamped(self.canvas(), x, y, w, h);
+        let c = rgba(self.secondary);
+        fill_rect(self.canvas_mut(), x, y, w, h, c);
+        let base = self.canvas().clone();
+        if let Some(sel) = self.selection.as_mut() {
+            sel.floating = Some(Floating { content, base });
         }
     }
 
-    /// Solleva il contenuto della selezione al primo movimento e lo sposta.
+    /// Sposta la selezione (con il suo contenuto) seguendo il mouse.
     fn move_selection(&mut self, p: (i32, i32), grab: (i32, i32)) {
-        let needs_lift = matches!(&self.selection, Some(s) if s.floating.is_none());
-        if needs_lift {
-            self.push_undo();
-            if let Some(sel) = &mut self.selection {
-                let content = imageops::crop_imm(
-                    &self.canvas,
-                    sel.x as u32,
-                    sel.y as u32,
-                    sel.w as u32,
-                    sel.h as u32,
-                )
-                .to_image();
-                fill_rect(
-                    &mut self.canvas,
-                    sel.x,
-                    sel.y,
-                    sel.w,
-                    sel.h,
-                    rgba(self.secondary),
-                );
-                sel.floating = Some(Floating {
-                    content,
-                    base: self.canvas.clone(),
-                });
-            }
+        if matches!(&self.selection, Some(s) if s.floating.is_none()) {
+            self.lift_selection();
         }
-        if let Some(sel) = &mut self.selection {
-            sel.x = p.0 - grab.0;
-            sel.y = p.1 - grab.1;
-            if let Some(f) = &sel.floating {
-                self.canvas.clone_from(&f.base);
-                overlay(&mut self.canvas, &f.content, sel.x, sel.y);
-            }
+        if self.selection.is_none() {
+            return;
+        }
+        let (x, y) = (p.0 - grab.0, p.1 - grab.1);
+        if let Some(sel) = self.selection.as_mut() {
+            sel.x = x;
+            sel.y = y;
+        }
+        let Some(mut floating) = self.selection.as_mut().and_then(|s| s.floating.take()) else {
+            return;
+        };
+        self.set_canvas(floating.base.clone());
+        overlay(self.canvas_mut(), &floating.content, x, y);
+        if let Some(sel) = self.selection.as_mut() {
+            sel.floating = Some(Floating {
+                content: std::mem::take(&mut floating.content),
+                base: floating.base,
+            });
         }
     }
 
@@ -1009,7 +1343,7 @@ impl PaintApp {
         self.text_edit = Some(TextEdit {
             pos: p,
             content: String::new(),
-            base: self.canvas.clone(),
+            base: self.canvas().clone(),
             color: [c.0[0], c.0[1], c.0[2]],
             needs_render: false,
             focus: true,
@@ -1022,10 +1356,19 @@ impl PaintApp {
             return;
         }
         let mut img = te.base.clone();
-        if let Some(font) = &self.font {
-            draw_text(&mut img, font, &te.content, te.pos, self.text_size as f32, te.color);
+        if !te.content.is_empty() {
+            if let Some(font) = &self.font {
+                draw_text(
+                    &mut img,
+                    font,
+                    &te.content,
+                    te.pos,
+                    self.text_size as f32,
+                    te.color,
+                );
+            }
         }
-        self.canvas = img;
+        self.set_canvas(img);
         self.dirty = true;
         if let Some(te) = &mut self.text_edit {
             te.needs_render = false;
@@ -1034,24 +1377,28 @@ impl PaintApp {
 
     fn commit_text(&mut self) {
         self.render_text();
-        let Some(te) = self.text_edit.take() else { return };
+        let Some(te) = self.text_edit.take() else {
+            return;
+        };
         if te.content.trim().is_empty() {
-            self.canvas = te.base;
+            self.set_canvas(te.base);
             self.dirty = true;
             return;
         }
         // La tela contiene gia' il testo: salviamo lo stato precedente per "Annulla".
-        if self.undo.len() >= MAX_UNDO {
-            self.undo.remove(0);
+        let mut state = self.snapshot();
+        if let Some(layer) = state.layers.get_mut(state.active) {
+            layer.image = te.base;
         }
-        self.undo.push(te.base);
+        self.undo.push(state);
         self.redo.clear();
+        self.trim_history();
         self.modified = true;
     }
 
     fn cancel_text(&mut self) {
         if let Some(te) = self.text_edit.take() {
-            self.canvas = te.base;
+            self.set_canvas(te.base);
             self.dirty = true;
         }
     }
@@ -1071,7 +1418,18 @@ impl PaintApp {
                 self.push_undo();
                 self.selection = None;
                 self.has_alpha = rgba_img.pixels().any(|p| p.0[3] < 255);
-                self.canvas = rgba_img;
+                let name = path
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Sfondo")
+                    .to_string();
+                self.layers = vec![Layer {
+                    name,
+                    image: rgba_img,
+                    visible: true,
+                    opacity: 1.0,
+                }];
+                self.active = 0;
                 self.file_path = Some(path);
                 self.modified = false;
                 self.dirty = true;
@@ -1112,13 +1470,13 @@ impl PaintApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let mut output = self.composite();
         let result = if matches!(ext.as_str(), "jpg" | "jpeg" | "bmp") {
             // JPEG e BMP non hanno trasparenza: appoggia su bianco.
-            let mut flat = self.canvas.clone();
-            flatten_on_white(&mut flat);
-            DynamicImage::ImageRgba8(flat).to_rgb8().save(&path)
+            flatten_on_white(&mut output);
+            DynamicImage::ImageRgba8(output).to_rgb8().save(&path)
         } else {
-            self.canvas.save(&path)
+            output.save(&path)
         };
         match result {
             Ok(()) => {
@@ -1142,10 +1500,10 @@ impl PaintApp {
             Tool::Picker => {
                 if p.0 >= 0
                     && p.1 >= 0
-                    && (p.0 as u32) < self.canvas.width()
-                    && (p.1 as u32) < self.canvas.height()
+                    && (p.0 as u32) < self.canvas().width()
+                    && (p.1 as u32) < self.canvas().height()
                 {
-                    let px = self.canvas.get_pixel(p.0 as u32, p.1 as u32).0;
+                    let px = self.canvas().get_pixel(p.0 as u32, p.1 as u32).0;
                     let picked = [px[0], px[1], px[2]];
                     if button == PointerButton::Secondary {
                         self.secondary = picked;
@@ -1157,7 +1515,7 @@ impl PaintApp {
             }
             Tool::Fill => {
                 self.push_undo();
-                flood_fill(&mut self.canvas, p.0, p.1, color);
+                flood_fill(self.canvas_mut(), p.0, p.1, color);
                 self.dirty = true;
                 return;
             }
@@ -1177,7 +1535,7 @@ impl PaintApp {
         }
         self.push_undo();
         let base = if matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ellipse) {
-            Some(self.canvas.clone())
+            Some(self.canvas().clone())
         } else {
             None
         };
@@ -1242,18 +1600,36 @@ impl PaintApp {
 
         match self.tool {
             Tool::Pencil | Tool::Brush | Tool::Eraser => {
-                line(&mut self.canvas, last.0, last.1, p.0, p.1, size, color);
+                line(self.canvas_mut(), last.0, last.1, p.0, p.1, size, color);
+            }
+            Tool::Smudge => {
+                let strength = self.smudge.clamp(0.05, 1.0);
+                let (dx, dy) = (p.0 - last.0, p.1 - last.1);
+                let step = (size as f32 / 4.0).max(1.0);
+                let steps = ((dx.abs().max(dy.abs()) as f32) / step).ceil().max(1.0) as i32;
+                let mut prev = last;
+                for i in 1..=steps {
+                    let t = i as f32 / steps as f32;
+                    let cur = (
+                        last.0 + (dx as f32 * t).round() as i32,
+                        last.1 + (dy as f32 * t).round() as i32,
+                    );
+                    smudge(self.canvas_mut(), prev, cur, size, strength);
+                    prev = cur;
+                }
             }
             Tool::Spray => {
-                spray(&mut self.canvas, &mut self.rng, p, size, color);
+                let mut rng = self.rng;
+                spray(self.canvas_mut(), &mut rng, p, size, color);
+                self.rng = rng;
             }
             Tool::Line | Tool::Rectangle | Tool::Ellipse => {
                 // Ripristina la tela com'era all'inizio e ridisegna la forma aggiornata.
-                if let Some(base) = self.stroke.as_ref().and_then(|s| s.base.as_ref()) {
-                    self.canvas.clone_from(base);
+                if let Some(base) = self.stroke.as_ref().and_then(|s| s.base.clone()) {
+                    self.set_canvas(base);
                 }
                 if self.tool == Tool::Line {
-                    line(&mut self.canvas, start.0, start.1, p.0, p.1, size, color);
+                    line(self.canvas_mut(), start.0, start.1, p.0, p.1, size, color);
                 } else {
                     let (border, fill) = match self.shape_mode {
                         ShapeMode::Outline => (Some(color), None),
@@ -1261,9 +1637,9 @@ impl PaintApp {
                         ShapeMode::Both => (Some(color), Some(other)),
                     };
                     if self.tool == Tool::Rectangle {
-                        rect_shape(&mut self.canvas, start, p, size, border, fill);
+                        rect_shape(self.canvas_mut(), start, p, size, border, fill);
                     } else {
-                        ellipse_shape(&mut self.canvas, start, p, size, border, fill);
+                        ellipse_shape(self.canvas_mut(), start, p, size, border, fill);
                     }
                 }
             }
@@ -1308,7 +1684,7 @@ impl PaintApp {
             let v = (p - rect.min) / zoom;
             (v.x.floor() as i32, v.y.floor() as i32)
         });
-        let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+        let (w, h) = (self.width() as i32, self.height() as i32);
         let in_bounds = |p: (i32, i32)| p.0 >= 0 && p.1 >= 0 && p.0 < w && p.1 < h;
 
         self.cursor_px = match px {
@@ -1360,8 +1736,19 @@ impl PaintApp {
     }
 
     fn upload_texture(&mut self, ctx: &egui::Context) {
-        let size = [self.canvas.width() as usize, self.canvas.height() as usize];
-        let image = egui::ColorImage::from_rgba_unmultiplied(size, self.canvas.as_raw());
+        // Il livello viene composto una sola volta, solo quando qualcosa cambia.
+        if self.dirty
+            || self.display.width() != self.width()
+            || self.display.height() != self.height()
+        {
+            self.display = self.composite();
+            self.has_alpha = self.display.pixels().any(|p| p.0[3] < 255);
+        }
+        let size = [
+            self.display.width() as usize,
+            self.display.height() as usize,
+        ];
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, self.display.as_raw());
         let options = TextureOptions {
             magnification: TextureFilter::Nearest,
             minification: TextureFilter::Linear,
@@ -1380,8 +1767,8 @@ impl PaintApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let sens = !typing; // non rubare i tasti a un campo di testo attivo
-        let (redo_shift, undo, redo_y, save_as, new, open, save, select_all, delete, escape) =
-            ctx.input_mut(|i| {
+        let (redo_shift, undo, redo_y, save_as, new, open, save, select_all, delete, escape) = ctx
+            .input_mut(|i| {
                 (
                     sens && i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
                     sens && i.consume_key(Modifiers::COMMAND, Key::Z),
@@ -1395,6 +1782,12 @@ impl PaintApp {
                     i.consume_key(Modifiers::NONE, Key::Escape),
                 )
             });
+
+        let new_layer =
+            sens && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::N));
+        if new_layer {
+            self.add_layer();
+        }
 
         // Copia / taglia / incolla arrivano come eventi dedicati.
         let (copy, cut, paste_evt, v_key) = ctx.input(|i| {
@@ -1440,7 +1833,7 @@ impl PaintApp {
             }
         }
         if new {
-            self.new_dialog = Some((self.canvas.width(), self.canvas.height()));
+            self.new_dialog = Some((self.canvas().width(), self.canvas().height()));
         }
         if open {
             self.open_file();
@@ -1456,30 +1849,30 @@ impl PaintApp {
 
     fn rotate_items(&mut self, ui: &mut egui::Ui) {
         if ui.button("Ruota di 90 gradi a destra").clicked() {
-            self.transform(|c| imageops::rotate90(c), "Ruotata a destra");
+            self.transform(imageops::rotate90, "Ruotata a destra");
             ui.close_menu();
         }
         if ui.button("Ruota di 90 gradi a sinistra").clicked() {
-            self.transform(|c| imageops::rotate270(c), "Ruotata a sinistra");
+            self.transform(imageops::rotate270, "Ruotata a sinistra");
             ui.close_menu();
         }
         if ui.button("Ruota di 180 gradi").clicked() {
-            self.transform(|c| imageops::rotate180(c), "Ruotata di 180 gradi");
+            self.transform(imageops::rotate180, "Ruotata di 180 gradi");
             ui.close_menu();
         }
         ui.separator();
         if ui.button("Capovolgi in orizzontale").clicked() {
-            self.transform(|c| imageops::flip_horizontal(c), "Capovolta in orizzontale");
+            self.transform(imageops::flip_horizontal, "Capovolta in orizzontale");
             ui.close_menu();
         }
         if ui.button("Capovolgi in verticale").clicked() {
-            self.transform(|c| imageops::flip_vertical(c), "Capovolta in verticale");
+            self.transform(imageops::flip_vertical, "Capovolta in verticale");
             ui.close_menu();
         }
     }
 
     fn open_resize_dialog(&mut self) {
-        let (w, h) = (self.canvas.width(), self.canvas.height());
+        let (w, h) = (self.canvas().width(), self.canvas().height());
         self.resize_dialog = Some(ResizeDialog {
             w,
             h,
@@ -1492,150 +1885,231 @@ impl PaintApp {
         let frame = egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(8.0, 2.0))
             .fill(ctx.style().visuals.panel_fill);
-        egui::TopBottomPanel::top("menu_bar").frame(frame).show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui
-                        .add(egui::Button::new("Nuovo...").shortcut_text("Ctrl+N"))
-                        .clicked()
-                    {
-                        self.new_dialog = Some((self.canvas.width(), self.canvas.height()));
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add(egui::Button::new("Apri...").shortcut_text("Ctrl+O"))
-                        .clicked()
-                    {
-                        ui.close_menu();
-                        self.open_file();
-                    }
-                    if ui
-                        .add(egui::Button::new("Salva").shortcut_text("Ctrl+S"))
-                        .clicked()
-                    {
-                        ui.close_menu();
-                        self.save();
-                    }
-                    if ui
-                        .add(egui::Button::new("Salva con nome...").shortcut_text("Ctrl+Maiusc+S"))
-                        .clicked()
-                    {
-                        ui.close_menu();
-                        self.save_as();
-                    }
-                    ui.separator();
-                    if ui.button("Esci").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("Modifica", |ui| {
-                    if ui
-                        .add_enabled(
-                            !self.undo.is_empty(),
-                            egui::Button::new("Annulla").shortcut_text("Ctrl+Z"),
-                        )
-                        .clicked()
-                    {
-                        self.do_undo();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.redo.is_empty(),
-                            egui::Button::new("Ripeti").shortcut_text("Ctrl+Y"),
-                        )
-                        .clicked()
-                    {
-                        self.do_redo();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    let has_sel = self.selection.is_some();
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Taglia").shortcut_text("Ctrl+X"))
-                        .clicked()
-                    {
-                        self.cut();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Copia").shortcut_text("Ctrl+C"))
-                        .clicked()
-                    {
-                        self.copy();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add(egui::Button::new("Incolla").shortcut_text("Ctrl+V"))
-                        .clicked()
-                    {
-                        self.paste();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Elimina").shortcut_text("Canc"))
-                        .clicked()
-                    {
-                        self.delete_selection();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add(egui::Button::new("Seleziona tutto").shortcut_text("Ctrl+A"))
-                        .clicked()
-                    {
-                        self.select_all();
-                        ui.close_menu();
-                    }
-                    if ui.button("Cancella tutto").clicked() {
-                        self.clear();
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Immagine", |ui| {
-                    if ui
-                        .add_enabled(self.selection.is_some(), egui::Button::new("Ritaglia selezione"))
-                        .clicked()
-                    {
-                        self.crop_to_selection();
-                        ui.close_menu();
-                    }
-                    if ui.button("Ridimensiona...").clicked() {
-                        self.open_resize_dialog();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    self.rotate_items(ui);
-                    ui.separator();
-                    if ui.button("Inverti colori").clicked() {
-                        self.invert_colors();
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Visualizza", |ui| {
-                    if ui.button("Ingrandisci").clicked() {
-                        self.zoom = (self.zoom * 1.25).min(16.0);
-                    }
-                    if ui.button("Riduci").clicked() {
-                        self.zoom = (self.zoom / 1.25).max(0.25);
-                    }
-                    if ui.button("Zoom 100%").clicked() {
-                        self.zoom = 1.0;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.checkbox(&mut self.dark, "Tema scuro").changed() {
-                        setup_style(ctx, self.dark);
-                    }
-                });
-                ui.menu_button("Info", |ui| {
-                    if ui.button(format!("Informazioni su {}", APP_NAME)).clicked() {
-                        self.about_open = true;
-                        ui.close_menu();
-                    }
+        egui::TopBottomPanel::top("menu_bar")
+            .frame(frame)
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui
+                            .add(egui::Button::new("Nuovo...").shortcut_text("Ctrl+N"))
+                            .clicked()
+                        {
+                            self.new_dialog = Some((self.canvas().width(), self.canvas().height()));
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::new("Apri...").shortcut_text("Ctrl+O"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.open_file();
+                        }
+                        if ui
+                            .add(egui::Button::new("Salva").shortcut_text("Ctrl+S"))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.save();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Salva con nome...")
+                                    .shortcut_text("Ctrl+Maiusc+S"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.save_as();
+                        }
+                        ui.separator();
+                        if ui.button("Esci").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                    ui.menu_button("Modifica", |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.undo.is_empty(),
+                                egui::Button::new("Annulla").shortcut_text("Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
+                            self.do_undo();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.redo.is_empty(),
+                                egui::Button::new("Ripeti").shortcut_text("Ctrl+Y"),
+                            )
+                            .clicked()
+                        {
+                            self.do_redo();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        let has_sel = self.selection.is_some();
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Taglia").shortcut_text("Ctrl+X"),
+                            )
+                            .clicked()
+                        {
+                            self.cut();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Copia").shortcut_text("Ctrl+C"),
+                            )
+                            .clicked()
+                        {
+                            self.copy();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::new("Incolla").shortcut_text("Ctrl+V"))
+                            .clicked()
+                        {
+                            self.paste();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Elimina").shortcut_text("Canc"),
+                            )
+                            .clicked()
+                        {
+                            self.delete_selection();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(egui::Button::new("Seleziona tutto").shortcut_text("Ctrl+A"))
+                            .clicked()
+                        {
+                            self.select_all();
+                            ui.close_menu();
+                        }
+                        if ui.button("Cancella tutto").clicked() {
+                            self.clear();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Immagine", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.selection.is_some(),
+                                egui::Button::new("Ritaglia selezione"),
+                            )
+                            .clicked()
+                        {
+                            self.crop_to_selection();
+                            ui.close_menu();
+                        }
+                        if ui.button("Ridimensiona...").clicked() {
+                            self.open_resize_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        self.rotate_items(ui);
+                        ui.separator();
+                        if ui.button("Inverti colori").clicked() {
+                            self.invert_colors();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Livello", |ui| {
+                        if ui
+                            .add(egui::Button::new("Nuovo livello").shortcut_text("Ctrl+Maiusc+N"))
+                            .clicked()
+                        {
+                            self.add_layer();
+                            ui.close_menu();
+                        }
+                        if ui.button("Duplica livello").clicked() {
+                            self.duplicate_layer();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.layers.len() > 1,
+                                egui::Button::new("Elimina livello"),
+                            )
+                            .clicked()
+                        {
+                            self.delete_layer();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.active + 1 < self.layers.len(),
+                                egui::Button::new("Sposta su"),
+                            )
+                            .clicked()
+                        {
+                            self.move_layer(true);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(self.active > 0, egui::Button::new("Sposta giù"))
+                            .clicked()
+                        {
+                            self.move_layer(false);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.active > 0,
+                                egui::Button::new("Unisci al livello sotto"),
+                            )
+                            .clicked()
+                        {
+                            self.merge_down();
+                            ui.close_menu();
+                        }
+                        if ui.button("Appiattisci tutto").clicked() {
+                            self.flatten_layers();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .checkbox(&mut self.show_layers, "Mostra il pannello livelli")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Visualizza", |ui| {
+                        if ui.button("Ingrandisci").clicked() {
+                            self.zoom = (self.zoom * 1.25).min(16.0);
+                        }
+                        if ui.button("Riduci").clicked() {
+                            self.zoom = (self.zoom / 1.25).max(0.25);
+                        }
+                        if ui.button("Zoom 100%").clicked() {
+                            self.zoom = 1.0;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.show_layers, "Pannello livelli");
+                        if ui.checkbox(&mut self.dark, "Tema scuro").changed() {
+                            setup_style(ctx, self.dark);
+                        }
+                    });
+                    ui.menu_button("Info", |ui| {
+                        if ui.button(format!("Informazioni su {}", APP_NAME)).clicked() {
+                            self.about_open = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
-        });
     }
 
     // ----- interfaccia: barra degli strumenti -------------------------------------
@@ -1650,7 +2124,7 @@ impl PaintApp {
             })
             .inner_margin(egui::Margin::symmetric(12.0, 8.0))
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 if dark {
                     Color32::from_gray(62)
                 } else {
@@ -1658,145 +2132,179 @@ impl PaintApp {
                 },
             ));
 
-        egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
-            ui.horizontal_top(|ui| {
-                // --- Appunti
-                group(ui, "Appunti", |ui| {
-                    let has_sel = self.selection.is_some();
-                    if ui
-                        .add(egui::Button::new("Incolla").min_size(vec2(84.0, 24.0)))
-                        .clicked()
-                    {
-                        self.paste();
-                    }
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Taglia").min_size(vec2(84.0, 24.0)))
-                        .clicked()
-                    {
-                        self.cut();
-                    }
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Copia").min_size(vec2(84.0, 24.0)))
-                        .clicked()
-                    {
-                        self.copy();
-                    }
-                });
-
-                // --- Immagine
-                group(ui, "Immagine", |ui| {
-                    let has_sel = self.selection.is_some();
-                    if ui
-                        .add_enabled(has_sel, egui::Button::new("Ritaglia").min_size(vec2(104.0, 24.0)))
-                        .clicked()
-                    {
-                        self.crop_to_selection();
-                    }
-                    if ui
-                        .add(egui::Button::new("Ridimensiona").min_size(vec2(104.0, 24.0)))
-                        .clicked()
-                    {
-                        self.open_resize_dialog();
-                    }
-                    ui.menu_button("Ruota / Capovolgi", |ui| {
-                        self.rotate_items(ui);
-                    });
-                });
-
-                // --- Strumenti
-                group(ui, "Strumenti", |ui| {
-                    egui::Grid::new("tools_grid").spacing([2.0, 2.0]).show(ui, |ui| {
-                        for (i, (tool, name)) in MAIN_TOOLS.iter().enumerate() {
-                            if tool_button(ui, self.tool == *tool, *tool, name, 34.0).clicked() {
-                                self.tool = *tool;
-                            }
-                            if i % 4 == 3 {
-                                ui.end_row();
-                            }
+        egui::TopBottomPanel::top("toolbar")
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // --- Appunti
+                    group(ui, "Appunti", |ui| {
+                        let has_sel = self.selection.is_some();
+                        if ui
+                            .add(egui::Button::new("Incolla").min_size(vec2(84.0, 24.0)))
+                            .clicked()
+                        {
+                            self.paste();
+                        }
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Taglia").min_size(vec2(84.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            self.cut();
+                        }
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Copia").min_size(vec2(84.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            self.copy();
                         }
                     });
-                });
 
-                // --- Forme
-                group(ui, "Forme", |ui| {
-                    ui.horizontal(|ui| {
-                        for (tool, name) in SHAPE_TOOLS.iter() {
-                            if tool_button(ui, self.tool == *tool, *tool, name, 34.0).clicked() {
-                                self.tool = *tool;
-                            }
+                    // --- Immagine
+                    group(ui, "Immagine", |ui| {
+                        let has_sel = self.selection.is_some();
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new("Ritaglia").min_size(vec2(104.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            self.crop_to_selection();
                         }
-                    });
-                    let current = match self.shape_mode {
-                        ShapeMode::Outline => "Contorno",
-                        ShapeMode::Filled => "Pieno",
-                        ShapeMode::Both => "Contorno + pieno",
-                    };
-                    egui::ComboBox::from_id_source("shape_mode")
-                        .width(100.0)
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.shape_mode, ShapeMode::Outline, "Contorno");
-                            ui.selectable_value(&mut self.shape_mode, ShapeMode::Filled, "Pieno");
-                            ui.selectable_value(&mut self.shape_mode, ShapeMode::Both, "Contorno + pieno");
+                        if ui
+                            .add(egui::Button::new("Ridimensiona").min_size(vec2(104.0, 24.0)))
+                            .clicked()
+                        {
+                            self.open_resize_dialog();
+                        }
+                        ui.menu_button("Ruota / Capovolgi", |ui| {
+                            self.rotate_items(ui);
                         });
-                });
-
-                // --- Dimensione
-                group(ui, "Dimensione", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Spessore");
-                        ui.add(egui::Slider::new(&mut self.size, 1..=64));
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Testo      ");
-                        ui.add(egui::Slider::new(&mut self.text_size, 8..=200));
-                    });
-                    ui.checkbox(&mut self.eraser_transparent, "Gomma trasparente");
-                });
 
-                // --- Colori
-                group(ui, "Colori", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.color_edit_button_srgb(&mut self.primary)
-                                    .on_hover_text("Colore 1 (clic sinistro)");
-                                ui.label(egui::RichText::new("Colore 1").small());
+                    // --- Strumenti
+                    group(ui, "Strumenti", |ui| {
+                        egui::Grid::new("tools_grid")
+                            .spacing([2.0, 2.0])
+                            .show(ui, |ui| {
+                                for (i, (tool, name)) in MAIN_TOOLS.iter().enumerate() {
+                                    if tool_button(ui, self.tool == *tool, *tool, name, 34.0)
+                                        .clicked()
+                                    {
+                                        self.tool = *tool;
+                                    }
+                                    if i % 4 == 3 {
+                                        ui.end_row();
+                                    }
+                                }
                             });
-                            ui.horizontal(|ui| {
-                                ui.color_edit_button_srgb(&mut self.secondary)
-                                    .on_hover_text("Colore 2 (clic destro)");
-                                ui.label(egui::RichText::new("Colore 2").small());
-                            });
-                            if ui.small_button("Scambia").clicked() {
-                                std::mem::swap(&mut self.primary, &mut self.secondary);
+                    });
+
+                    // --- Forme
+                    group(ui, "Forme", |ui| {
+                        ui.horizontal(|ui| {
+                            for (tool, name) in SHAPE_TOOLS.iter() {
+                                if tool_button(ui, self.tool == *tool, *tool, name, 34.0).clicked()
+                                {
+                                    self.tool = *tool;
+                                }
                             }
                         });
-                        egui::Grid::new("palette").spacing([3.0, 3.0]).show(ui, |ui| {
-                            for (i, c) in PALETTE.iter().enumerate() {
-                                let resp = ui
-                                    .add(
-                                        egui::Button::new("")
-                                            .fill(Color32::from_rgb(c[0], c[1], c[2]))
-                                            .rounding(4.0)
-                                            .min_size(Vec2::splat(20.0)),
-                                    )
-                                    .on_hover_text("Sinistro: colore 1 - Destro: colore 2");
-                                if resp.clicked() {
-                                    self.primary = *c;
+                        let current = match self.shape_mode {
+                            ShapeMode::Outline => "Contorno",
+                            ShapeMode::Filled => "Pieno",
+                            ShapeMode::Both => "Contorno + pieno",
+                        };
+                        egui::ComboBox::from_id_salt("shape_mode")
+                            .width(100.0)
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.shape_mode,
+                                    ShapeMode::Outline,
+                                    "Contorno",
+                                );
+                                ui.selectable_value(
+                                    &mut self.shape_mode,
+                                    ShapeMode::Filled,
+                                    "Pieno",
+                                );
+                                ui.selectable_value(
+                                    &mut self.shape_mode,
+                                    ShapeMode::Both,
+                                    "Contorno + pieno",
+                                );
+                            });
+                    });
+
+                    // --- Dimensione
+                    group(ui, "Dimensione", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Spessore");
+                            ui.add(egui::Slider::new(&mut self.size, 1..=64));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Testo      ");
+                            ui.add(egui::Slider::new(&mut self.text_size, 8..=200));
+                        });
+                        ui.checkbox(&mut self.eraser_transparent, "Gomma trasparente");
+                        ui.horizontal(|ui| {
+                            ui.label("Fluidità");
+                            ui.add(egui::Slider::new(&mut self.smudge, 0.05..=1.0).max_decimals(2));
+                        });
+                    });
+
+                    // --- Colori
+                    group(ui, "Colori", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.color_edit_button_srgb(&mut self.primary)
+                                        .on_hover_text("Colore 1 (clic sinistro)");
+                                    ui.label(egui::RichText::new("Colore 1").small());
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.color_edit_button_srgb(&mut self.secondary)
+                                        .on_hover_text("Colore 2 (clic destro)");
+                                    ui.label(egui::RichText::new("Colore 2").small());
+                                });
+                                if ui.small_button("Scambia").clicked() {
+                                    std::mem::swap(&mut self.primary, &mut self.secondary);
                                 }
-                                if resp.secondary_clicked() {
-                                    self.secondary = *c;
-                                }
-                                if i % 10 == 9 {
-                                    ui.end_row();
-                                }
-                            }
+                            });
+                            egui::Grid::new("palette")
+                                .spacing([3.0, 3.0])
+                                .show(ui, |ui| {
+                                    for (i, c) in PALETTE.iter().enumerate() {
+                                        let resp = ui
+                                            .add(
+                                                egui::Button::new("")
+                                                    .fill(Color32::from_rgb(c[0], c[1], c[2]))
+                                                    .rounding(4.0)
+                                                    .min_size(Vec2::splat(20.0)),
+                                            )
+                                            .on_hover_text("Sinistro: colore 1 - Destro: colore 2");
+                                        if resp.clicked() {
+                                            self.primary = *c;
+                                        }
+                                        if resp.secondary_clicked() {
+                                            self.secondary = *c;
+                                        }
+                                        if i % 10 == 9 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
                         });
                     });
                 });
             });
-        });
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
@@ -1812,7 +2320,9 @@ impl PaintApp {
                     ui.label(format!("Selezione: {} x {} px", s.w, s.h));
                     ui.separator();
                 }
-                ui.label(format!("{} x {} px", self.canvas.width(), self.canvas.height()));
+                ui.label(format!("{} x {} px", self.width(), self.height()));
+                ui.separator();
+                ui.label(format!("Livelli: {}", self.layers.len()));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("100%").clicked() {
@@ -1830,6 +2340,130 @@ impl PaintApp {
                 });
             });
         });
+    }
+
+    // ----- interfaccia: pannello livelli ------------------------------------------------
+
+    fn select_layer(&mut self, index: usize) {
+        if index >= self.layers.len() || index == self.active {
+            return;
+        }
+        self.commit_text();
+        self.selection = None;
+        self.active = index;
+        self.dirty = true;
+        self.status = format!("Livello: {}", self.layers[index].name);
+    }
+
+    fn layers_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_layers {
+            return;
+        }
+        egui::SidePanel::right("layers_panel")
+            .resizable(true)
+            .default_width(232.0)
+            .width_range(184.0..=360.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.strong("Livelli");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Nascondi").clicked() {
+                            self.show_layers = false;
+                        }
+                    });
+                });
+                ui.separator();
+
+                // Elenco dal livello più alto al più basso.
+                let mut select: Option<usize> = None;
+                let mut toggle: Option<usize> = None;
+                let count = self.layers.len();
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for i in (0..count).rev() {
+                            let selected = i == self.active;
+                            ui.horizontal(|ui| {
+                                let mut visible = self.layers[i].visible;
+                                if ui
+                                    .checkbox(&mut visible, "")
+                                    .on_hover_text("Mostra o nascondi il livello")
+                                    .changed()
+                                {
+                                    toggle = Some(i);
+                                }
+                                let name = self.layers[i].name.clone();
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 22.0],
+                                        egui::SelectableLabel::new(selected, name),
+                                    )
+                                    .clicked()
+                                {
+                                    select = Some(i);
+                                }
+                            });
+                        }
+                    });
+
+                if let Some(i) = toggle {
+                    self.layers[i].visible = !self.layers[i].visible;
+                    self.dirty = true;
+                }
+                if let Some(i) = select {
+                    self.select_layer(i);
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Opacità");
+                    let mut opacity = self.layers[self.active].opacity;
+                    if ui
+                        .add(egui::Slider::new(&mut opacity, 0.0..=1.0).max_decimals(2))
+                        .changed()
+                    {
+                        self.layers[self.active].opacity = opacity;
+                        self.dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Nome");
+                    let mut name = self.layers[self.active].name.clone();
+                    if ui.text_edit_singleline(&mut name).changed() {
+                        self.layers[self.active].name = name;
+                    }
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Nuovo")
+                        .on_hover_text("Nuovo livello trasparente (Ctrl+Maiusc+N)")
+                        .clicked()
+                    {
+                        self.add_layer();
+                    }
+                    if ui.button("Duplica").clicked() {
+                        self.duplicate_layer();
+                    }
+                    if ui.button("Elimina").clicked() {
+                        self.delete_layer();
+                    }
+                    if ui.button("Su").on_hover_text("Sposta su").clicked() {
+                        self.move_layer(true);
+                    }
+                    if ui.button("Giù").on_hover_text("Sposta giù").clicked() {
+                        self.move_layer(false);
+                    }
+                    if ui.button("Unisci sotto").clicked() {
+                        self.merge_down();
+                    }
+                    if ui.button("Appiattisci").clicked() {
+                        self.flatten_layers();
+                    }
+                });
+            });
     }
 
     // ----- interfaccia: tela ---------------------------------------------------------
@@ -1857,8 +2491,7 @@ impl PaintApp {
                 .auto_shrink([false, false])
                 .drag_to_scroll(false)
                 .show(ui, |ui| {
-                    let size = Vec2::new(self.canvas.width() as f32, self.canvas.height() as f32)
-                        * self.zoom;
+                    let size = Vec2::new(self.width() as f32, self.height() as f32) * self.zoom;
                     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
 
                     self.process_canvas_input(ui, &response, rect);
@@ -1918,7 +2551,11 @@ impl PaintApp {
     fn draw_overlays(&self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
         let painter = ui.painter();
 
-        painter.rect_stroke(rect.expand(0.5), 0.0, Stroke::new(1.0, Color32::from_black_alpha(90)));
+        painter.rect_stroke(
+            rect.expand(0.5),
+            0.0,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(90)),
+        );
 
         if let Some(sel) = &self.selection {
             let min = rect.min + vec2(sel.x as f32, sel.y as f32) * self.zoom;
@@ -1931,21 +2568,21 @@ impl PaintApp {
                 let top = rect.min + vec2(te.pos.0 as f32, te.pos.1 as f32) * self.zoom;
                 painter.line_segment(
                     [top, top + vec2(0.0, self.text_size as f32 * self.zoom)],
-                    Stroke::new(1.5, ACCENT),
+                    Stroke::new(1.5_f32, ACCENT),
                 );
             }
         }
 
         if response.hovered() {
             let radius = match self.tool {
-                Tool::Brush | Tool::Eraser => self.size as f32 / 2.0,
+                Tool::Brush | Tool::Eraser | Tool::Smudge => self.size as f32 / 2.0,
                 Tool::Spray => self.size as f32,
                 _ => return,
             };
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 let r = (radius * self.zoom).max(2.0);
-                painter.circle_stroke(pos, r + 1.0, Stroke::new(1.0, Color32::WHITE));
-                painter.circle_stroke(pos, r, Stroke::new(1.0, Color32::BLACK));
+                painter.circle_stroke(pos, r + 1.0, Stroke::new(1.0_f32, Color32::WHITE));
+                painter.circle_stroke(pos, r, Stroke::new(1.0_f32, Color32::BLACK));
             }
         }
     }
@@ -1983,7 +2620,11 @@ impl PaintApp {
                     if self.text_size != before {
                         changed = true;
                     }
-                    ui.label(egui::RichText::new("Clic sulla tela per spostare il testo").small().weak());
+                    ui.label(
+                        egui::RichText::new("Clic sulla tela per spostare il testo")
+                            .small()
+                            .weak(),
+                    );
                     ui.horizontal(|ui| {
                         if ui.button("Applica").clicked() {
                             action = Some(true);
@@ -2106,14 +2747,17 @@ impl PaintApp {
                 ui.add_space(4.0);
                 ui.heading(APP_NAME);
                 ui.add_space(6.0);
-                egui::Grid::new("about_grid").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Nome del programma").weak());
-                    ui.label(APP_NAME);
-                    ui.end_row();
-                    ui.label(egui::RichText::new("Versione").weak());
-                    ui.label(APP_VERSION);
-                    ui.end_row();
-                });
+                egui::Grid::new("about_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Nome del programma").weak());
+                        ui.label(APP_NAME);
+                        ui.end_row();
+                        ui.label(egui::RichText::new("Versione").weak());
+                        ui.label(APP_VERSION);
+                        ui.end_row();
+                    });
                 ui.add_space(8.0);
                 ui.label(APP_DESCRIPTION);
                 ui.add_space(10.0);
@@ -2163,6 +2807,7 @@ impl eframe::App for PaintApp {
         self.resize_dialog_ui(ctx);
         self.about_dialog(ctx);
         self.render_text();
+        self.layers_panel(ctx);
         self.canvas_panel(ctx);
         self.update_title(ctx);
     }

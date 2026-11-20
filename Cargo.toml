@@ -4,6 +4,10 @@ version = "1.0.0"
 edition = "2021"
 description = "Paint CP - app semplice per piccole modifiche alle foto in stile Paint"
 
+[[bin]]
+name = "paint_cp"
+path = "main.rs"
+
 [dependencies]
 eframe = "0.29"
 rfd = "0.15"
