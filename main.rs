@@ -26,7 +26,7 @@ const BLACK: [u8; 3] = [0, 0, 0];
 const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
-const APP_VERSION: &str = "1.2";
+const APP_VERSION: &str = "1.3";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
 
@@ -337,6 +337,8 @@ struct PaintApp {
     dark: bool,
     /// Apri la finestra sempre massimizzata (Impostazioni).
     maximized: bool,
+    /// Primo frame: applica lo stato massimizzato prima di mostrare la finestra.
+    first_frame: bool,
     /// Lingua dell'interfaccia (Impostazioni).
     lang: Lang,
 
@@ -1046,6 +1048,7 @@ impl PaintApp {
             show_ruler: true,
             dark: settings.dark,
             maximized: settings.maximized,
+            first_frame: true,
             lang,
             stroke: None,
             resize_drag: None,
@@ -3623,6 +3626,15 @@ impl PaintApp {
 
 impl eframe::App for PaintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Al primo frame: se richiesto, massimizza la finestra prima che venga
+        // mostrata (evita il ridimensionamento visibile e il flicker).
+        if self.first_frame {
+            self.first_frame = false;
+            if self.maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+        }
         self.handle_shortcuts(ctx);
         self.menu_bar(ctx);
         self.toolbar(ctx);
@@ -3647,10 +3659,12 @@ impl eframe::App for PaintApp {
 
 fn main() -> eframe::Result<()> {
     let settings = Settings::load();
+    // Se avvio massimizzato: finestra creata nascosta, massimizzata al primo
+    // frame (in update) e poi mostrata da eframe: evita il resize visibile.
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([1040.0, 520.0])
-        .with_maximized(settings.maximized)
+        .with_visible(!settings.maximized)
         .with_title(format!("Senza titolo - {}", APP_NAME));
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);

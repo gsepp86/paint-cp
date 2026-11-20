@@ -2,7 +2,7 @@
 ; Si compila con: ISCC.exe installer\paint_cp.iss  (dopo cargo build --release)
 
 #define AppNome "Paint CP"
-#define AppVersione "1.2"
+#define AppVersione "1.3"
 #define AppEditore "Peppe CP"
 #define AppExe "paint_cp.exe"
 
