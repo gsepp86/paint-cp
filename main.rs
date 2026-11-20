@@ -26,7 +26,7 @@ const BLACK: [u8; 3] = [0, 0, 0];
 const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
-const APP_VERSION: &str = "1.1";
+const APP_VERSION: &str = "1.2";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
 
@@ -61,39 +61,74 @@ fn settings_path() -> Option<PathBuf> {
     base.map(|b| b.join(folder).join("settings.txt"))
 }
 
-/// Legge la lingua salvata; se il file manca si parte dall'italiano.
-fn load_lang() -> Lang {
-    let Some(path) = settings_path() else {
-        return Lang::It;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Lang::It;
-    };
-    for line in text.lines() {
-        if let Some(value) = line.trim().strip_prefix("lang=") {
-            return if value.trim().eq_ignore_ascii_case("en") {
-                Lang::En
-            } else {
-                Lang::It
-            };
-        }
-    }
-    Lang::It
+/// Impostazioni salvate: lingua, tema e avvio massimizzato.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Settings {
+    lang: Lang,
+    dark: bool,
+    maximized: bool,
 }
 
-/// Salva la lingua scelta; un errore di scrittura non blocca l'app.
-fn save_lang(lang: Lang) {
-    let Some(path) = settings_path() else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            lang: Lang::It,
+            dark: false,
+            maximized: false,
+        }
     }
-    let value = match lang {
-        Lang::It => "it",
-        Lang::En => "en",
-    };
-    let _ = std::fs::write(path, format!("lang={value}\n"));
+}
+
+impl Settings {
+    /// Legge il file di configurazione; i valori mancanti restano sul default.
+    fn load() -> Self {
+        let mut settings = Self::default();
+        let Some(path) = settings_path() else {
+            return settings;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return settings;
+        };
+        for line in text.lines() {
+            let Some((key, value)) = line.trim().split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "lang" => {
+                    settings.lang = if value.eq_ignore_ascii_case("en") {
+                        Lang::En
+                    } else {
+                        Lang::It
+                    };
+                }
+                "theme" => settings.dark = value.eq_ignore_ascii_case("dark"),
+                "maximized" => settings.maximized = matches!(value, "1" | "true" | "yes" | "si"),
+                _ => {}
+            }
+        }
+        settings
+    }
+
+    /// Scrive tutte le impostazioni; un errore di scrittura non blocca l'app.
+    fn save(self) {
+        let Some(path) = settings_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let lang = match self.lang {
+            Lang::It => "it",
+            Lang::En => "en",
+        };
+        let theme = if self.dark { "dark" } else { "light" };
+        let maximized = if self.maximized { 1 } else { 0 };
+        let _ = std::fs::write(
+            path,
+            format!("lang={lang}\ntheme={theme}\nmaximized={maximized}\n"),
+        );
+    }
 }
 
 const PALETTE: [[u8; 3]; 30] = [
@@ -300,6 +335,8 @@ struct PaintApp {
     zoom: f32,
     show_ruler: bool,
     dark: bool,
+    /// Apri la finestra sempre massimizzata (Impostazioni).
+    maximized: bool,
     /// Lingua dell'interfaccia (Impostazioni).
     lang: Lang,
 
@@ -316,6 +353,7 @@ struct PaintApp {
     new_dialog: Option<(u32, u32)>,
     resize_dialog: Option<ResizeDialog>,
     about_open: bool,
+    settings_open: bool,
     status: String,
     last_title: String,
     rng: u64,
@@ -979,8 +1017,9 @@ fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 impl PaintApp {
     fn new(ctx: &egui::Context) -> Self {
-        setup_style(ctx, false);
-        let lang = load_lang();
+        let settings = Settings::load();
+        setup_style(ctx, settings.dark);
+        let lang = settings.lang;
         Self {
             layers: vec![Layer::background(
                 DEFAULT_SIZE.0,
@@ -1005,7 +1044,8 @@ impl PaintApp {
             eraser_transparent: false,
             zoom: 1.0,
             show_ruler: true,
-            dark: false,
+            dark: settings.dark,
+            maximized: settings.maximized,
             lang,
             stroke: None,
             resize_drag: None,
@@ -1019,6 +1059,7 @@ impl PaintApp {
             new_dialog: None,
             resize_dialog: None,
             about_open: false,
+            settings_open: false,
             status: String::from(tr(lang, "Pronto", "Ready")),
             last_title: String::new(),
             rng: 0x2545_F491_4F6C_DD1D,
@@ -2409,11 +2450,43 @@ impl PaintApp {
                             &mut self.show_layers,
                             tr(self.lang, "Pannello livelli", "Layers panel"),
                         );
+                    });
+                    ui.menu_button(tr(self.lang, "Impostazioni", "Settings"), |ui| {
                         if ui
-                            .checkbox(&mut self.dark, tr(self.lang, "Tema scuro", "Dark theme"))
-                            .changed()
+                            .button(tr(self.lang, "Apri impostazioni...", "Open settings..."))
+                            .clicked()
                         {
+                            self.settings_open = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.strong(tr(self.lang, "Lingua", "Language"));
+                        let lang_before = self.lang;
+                        ui.radio_value(&mut self.lang, Lang::It, "Italiano");
+                        ui.radio_value(&mut self.lang, Lang::En, "English");
+                        ui.separator();
+                        ui.strong(tr(self.lang, "Tema", "Theme"));
+                        let dark_before = self.dark;
+                        ui.radio_value(&mut self.dark, false, tr(self.lang, "Chiaro", "Light"));
+                        ui.radio_value(&mut self.dark, true, tr(self.lang, "Scuro", "Dark"));
+                        ui.separator();
+                        let max_before = self.maximized;
+                        ui.checkbox(
+                            &mut self.maximized,
+                            tr(
+                                self.lang,
+                                "Apri sempre massimizzato",
+                                "Always open maximized",
+                            ),
+                        );
+                        if self.dark != dark_before {
                             setup_style(ctx, self.dark);
+                        }
+                        if self.lang != lang_before
+                            || self.dark != dark_before
+                            || self.maximized != max_before
+                        {
+                            self.save_settings();
                         }
                     });
                     ui.menu_button("Info", |ui| {
@@ -2427,15 +2500,6 @@ impl PaintApp {
                         {
                             self.about_open = true;
                             ui.close_menu();
-                        }
-                    });
-                    ui.menu_button(tr(self.lang, "Impostazioni", "Settings"), |ui| {
-                        ui.strong(tr(self.lang, "Lingua", "Language"));
-                        let before = self.lang;
-                        ui.radio_value(&mut self.lang, Lang::It, "Italiano");
-                        ui.radio_value(&mut self.lang, Lang::En, "English");
-                        if self.lang != before {
-                            save_lang(self.lang);
                         }
                     });
                 });
@@ -3392,6 +3456,83 @@ impl PaintApp {
         }
     }
 
+    /// Salva lingua, tema e avvio massimizzato nelle impostazioni.
+    fn save_settings(&self) {
+        Settings {
+            lang: self.lang,
+            dark: self.dark,
+            maximized: self.maximized,
+        }
+        .save();
+    }
+
+    /// Finestra Impostazioni: lingua, tema e avvio massimizzato.
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(tr(self.lang, "Impostazioni", "Settings"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.add_space(4.0);
+                let lang_before = self.lang;
+                let dark_before = self.dark;
+                let max_before = self.maximized;
+
+                ui.strong(tr(self.lang, "Lingua", "Language"));
+                ui.radio_value(&mut self.lang, Lang::It, "Italiano");
+                ui.radio_value(&mut self.lang, Lang::En, "English");
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                ui.strong(tr(self.lang, "Tema", "Theme"));
+                ui.radio_value(&mut self.dark, false, tr(self.lang, "Chiaro", "Light"));
+                ui.radio_value(&mut self.dark, true, tr(self.lang, "Scuro", "Dark"));
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                ui.checkbox(
+                    &mut self.maximized,
+                    tr(
+                        self.lang,
+                        "Apri sempre massimizzato",
+                        "Always open maximized",
+                    ),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        self.lang,
+                        "L'avvio massimizzato vale dal prossimo avvio.",
+                        "Maximized start applies from the next launch.",
+                    ))
+                    .weak()
+                    .small(),
+                );
+
+                if self.dark != dark_before {
+                    setup_style(ctx, self.dark);
+                }
+                if self.lang != lang_before
+                    || self.dark != dark_before
+                    || self.maximized != max_before
+                {
+                    self.save_settings();
+                }
+            });
+        if !open {
+            self.settings_open = false;
+        }
+    }
+
     fn about_dialog(&mut self, ctx: &egui::Context) {
         if !self.about_open {
             return;
@@ -3408,7 +3549,7 @@ impl PaintApp {
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_max_width(380.0);
+            ui.set_max_width(400.0);
             ui.add_space(4.0);
             ui.heading(APP_NAME);
             ui.add_space(6.0);
@@ -3428,6 +3569,28 @@ impl PaintApp {
                 });
             ui.add_space(8.0);
             ui.label(tr(self.lang, APP_DESCRIPTION, APP_DESCRIPTION_EN));
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(tr(
+                self.lang,
+                "Se vuoi contribuire al mio lavoro, visto il tempo che ti farà risparmiare quando stampi tanti file, qui sotto trovi il pulsante per contribuire anche con una piccola donazione simbolica: una app così utile, gratis per sempre, non la trovi ovunque. Apprezzo il gesto ;-)",
+                "If you want to support my work, given the time it will save you when printing lots of files, below you'll find a button to contribute even with a small symbolic donation: an app this useful, free forever, isn't easy to find. I appreciate it ;-)",
+            ));
+            ui.add_space(8.0);
+            let donate = egui::Button::new(
+                egui::RichText::new(tr(self.lang, "Dona via PayPal", "Donate via PayPal"))
+                    .color(Color32::WHITE)
+                    .strong(),
+            )
+            .fill(Color32::from_rgb(0, 112, 186));
+            if ui
+                .add(donate)
+                .on_hover_text("https://paypal.me/PeppeCP")
+                .clicked()
+            {
+                ctx.open_url(egui::OpenUrl::new_tab("https://paypal.me/PeppeCP"));
+            }
             ui.add_space(10.0);
             if ui.button(tr(self.lang, "Chiudi", "Close")).clicked() {
                 close_clicked = true;
@@ -3473,6 +3636,7 @@ impl eframe::App for PaintApp {
         self.text_dialog(ctx);
         self.new_image_dialog(ctx);
         self.resize_dialog_ui(ctx);
+        self.settings_dialog(ctx);
         self.about_dialog(ctx);
         self.render_text();
         self.layers_panel(ctx);
@@ -3482,9 +3646,11 @@ impl eframe::App for PaintApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let settings = Settings::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([1040.0, 520.0])
+        .with_maximized(settings.maximized)
         .with_title(format!("Senza titolo - {}", APP_NAME));
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
