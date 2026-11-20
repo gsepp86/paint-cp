@@ -45,6 +45,57 @@ fn tr(lang: Lang, it: &'static str, en: &'static str) -> &'static str {
     }
 }
 
+/// File di configurazione con le impostazioni salvate (per ora la lingua).
+fn settings_path() -> Option<PathBuf> {
+    let folder = if cfg!(windows) {
+        "Paint CP"
+    } else {
+        "paint-cp"
+    };
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    base.map(|b| b.join(folder).join("settings.txt"))
+}
+
+/// Legge la lingua salvata; se il file manca si parte dall'italiano.
+fn load_lang() -> Lang {
+    let Some(path) = settings_path() else {
+        return Lang::It;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Lang::It;
+    };
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("lang=") {
+            return if value.trim().eq_ignore_ascii_case("en") {
+                Lang::En
+            } else {
+                Lang::It
+            };
+        }
+    }
+    Lang::It
+}
+
+/// Salva la lingua scelta; un errore di scrittura non blocca l'app.
+fn save_lang(lang: Lang) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let value = match lang {
+        Lang::It => "it",
+        Lang::En => "en",
+    };
+    let _ = std::fs::write(path, format!("lang={value}\n"));
+}
+
 const PALETTE: [[u8; 3]; 30] = [
     [0, 0, 0],
     [64, 64, 64],
@@ -929,7 +980,7 @@ fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 impl PaintApp {
     fn new(ctx: &egui::Context) -> Self {
         setup_style(ctx, false);
-        let lang = Lang::It;
+        let lang = load_lang();
         Self {
             layers: vec![Layer::background(
                 DEFAULT_SIZE.0,
@@ -2380,8 +2431,12 @@ impl PaintApp {
                     });
                     ui.menu_button(tr(self.lang, "Impostazioni", "Settings"), |ui| {
                         ui.strong(tr(self.lang, "Lingua", "Language"));
+                        let before = self.lang;
                         ui.radio_value(&mut self.lang, Lang::It, "Italiano");
                         ui.radio_value(&mut self.lang, Lang::En, "English");
+                        if self.lang != before {
+                            save_lang(self.lang);
+                        }
                     });
                 });
             });
