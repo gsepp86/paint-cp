@@ -28,6 +28,22 @@ const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 const APP_NAME: &str = "Paint CP";
 const APP_VERSION: &str = "1.1";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
+const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
+
+/// Lingua dell'interfaccia, scelta nella sezione Impostazioni.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    It,
+    En,
+}
+
+/// Testo dell'interfaccia nella lingua scelta (italiano o inglese).
+fn tr(lang: Lang, it: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        Lang::It => it,
+        Lang::En => en,
+    }
+}
 
 const PALETTE: [[u8; 3]; 30] = [
     [0, 0, 0],
@@ -82,22 +98,26 @@ enum Tool {
     Ellipse,
 }
 
-const MAIN_TOOLS: [(Tool, &str); 9] = [
-    (Tool::Select, "Seleziona (rettangolo)"),
-    (Tool::Pencil, "Matita"),
-    (Tool::Brush, "Pennello"),
-    (Tool::Smudge, "Fluidifica (sfuma e trascina i colori)"),
-    (Tool::Eraser, "Gomma"),
-    (Tool::Spray, "Spray"),
-    (Tool::Fill, "Secchiello"),
-    (Tool::Picker, "Contagocce"),
-    (Tool::Text, "Testo"),
+const MAIN_TOOLS: [(Tool, &str, &str); 9] = [
+    (Tool::Select, "Seleziona (rettangolo)", "Select (rectangle)"),
+    (Tool::Pencil, "Matita", "Pencil"),
+    (Tool::Brush, "Pennello", "Brush"),
+    (
+        Tool::Smudge,
+        "Fluidifica (sfuma e trascina i colori)",
+        "Smudge (blend and drag colors)",
+    ),
+    (Tool::Eraser, "Gomma", "Eraser"),
+    (Tool::Spray, "Spray", "Spray"),
+    (Tool::Fill, "Secchiello", "Fill"),
+    (Tool::Picker, "Contagocce", "Color picker"),
+    (Tool::Text, "Testo", "Text"),
 ];
 
-const SHAPE_TOOLS: [(Tool, &str); 3] = [
-    (Tool::Line, "Linea"),
-    (Tool::Rectangle, "Rettangolo"),
-    (Tool::Ellipse, "Ellisse"),
+const SHAPE_TOOLS: [(Tool, &str, &str); 3] = [
+    (Tool::Line, "Linea", "Line"),
+    (Tool::Rectangle, "Rettangolo", "Rectangle"),
+    (Tool::Ellipse, "Ellisse", "Ellipse"),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,9 +196,9 @@ struct Layer {
 }
 
 impl Layer {
-    fn background(w: u32, h: u32) -> Self {
+    fn background(w: u32, h: u32, name: &str) -> Self {
         Self {
-            name: String::from("Sfondo"),
+            name: name.to_string(),
             image: RgbaImage::from_pixel(w.max(1), h.max(1), rgba(WHITE)),
             visible: true,
             opacity: 1.0,
@@ -229,6 +249,8 @@ struct PaintApp {
     zoom: f32,
     show_ruler: bool,
     dark: bool,
+    /// Lingua dell'interfaccia (Impostazioni).
+    lang: Lang,
 
     stroke: Option<ActiveStroke>,
     resize_drag: Option<CanvasResize>,
@@ -907,8 +929,13 @@ fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 impl PaintApp {
     fn new(ctx: &egui::Context) -> Self {
         setup_style(ctx, false);
+        let lang = Lang::It;
         Self {
-            layers: vec![Layer::background(DEFAULT_SIZE.0, DEFAULT_SIZE.1)],
+            layers: vec![Layer::background(
+                DEFAULT_SIZE.0,
+                DEFAULT_SIZE.1,
+                tr(lang, "Sfondo", "Background"),
+            )],
             active: 0,
             display: RgbaImage::from_pixel(DEFAULT_SIZE.0, DEFAULT_SIZE.1, rgba(WHITE)),
             texture: None,
@@ -928,6 +955,7 @@ impl PaintApp {
             zoom: 1.0,
             show_ruler: true,
             dark: false,
+            lang,
             stroke: None,
             resize_drag: None,
             selection: None,
@@ -940,7 +968,7 @@ impl PaintApp {
             new_dialog: None,
             resize_dialog: None,
             about_open: false,
-            status: String::from("Pronto"),
+            status: String::from(tr(lang, "Pronto", "Ready")),
             last_title: String::new(),
             rng: 0x2545_F491_4F6C_DD1D,
         }
@@ -1019,8 +1047,11 @@ impl PaintApp {
     fn restore(&mut self, state: DocState) {
         self.layers = state.layers;
         if self.layers.is_empty() {
-            self.layers
-                .push(Layer::background(self.width(), self.height()));
+            self.layers.push(Layer::background(
+                self.width(),
+                self.height(),
+                tr(self.lang, "Sfondo", "Background"),
+            ));
         }
         self.active = state.active.min(self.layers.len() - 1);
         self.stroke = None;
@@ -1076,13 +1107,17 @@ impl PaintApp {
         self.commit_text();
         self.push_undo();
         self.selection = None;
-        self.layers = vec![Layer::background(w, h)];
+        self.layers = vec![Layer::background(
+            w,
+            h,
+            tr(self.lang, "Sfondo", "Background"),
+        )];
         self.active = 0;
         self.has_alpha = false;
         self.file_path = None;
         self.modified = false;
         self.dirty = true;
-        self.status = String::from("Nuova immagine");
+        self.status = String::from(tr(self.lang, "Nuova immagine", "New image"));
     }
 
     fn clear(&mut self) {
@@ -1093,7 +1128,7 @@ impl PaintApp {
             *p = c;
         }
         self.dirty = true;
-        self.status = String::from("Livello svuotato");
+        self.status = String::from(tr(self.lang, "Livello svuotato", "Layer cleared"));
     }
 
     fn transform(&mut self, f: impl Fn(&RgbaImage) -> RgbaImage, msg: &str) {
@@ -1115,7 +1150,7 @@ impl PaintApp {
             }
         }
         self.dirty = true;
-        self.status = String::from("Colori invertiti");
+        self.status = String::from(tr(self.lang, "Colori invertiti", "Colors inverted"));
     }
 
     fn resize_image(&mut self, w: u32, h: u32) {
@@ -1126,7 +1161,12 @@ impl PaintApp {
             layer.image = imageops::resize(&layer.image, w, h, imageops::FilterType::Lanczos3);
         }
         self.dirty = true;
-        self.status = format!("Ridimensionata a {} x {}", w, h);
+        self.status = format!(
+            "{} {} x {}",
+            tr(self.lang, "Ridimensionata a", "Resized to"),
+            w,
+            h
+        );
     }
 
     // ----- livelli ---------------------------------------------------------
@@ -1147,7 +1187,11 @@ impl PaintApp {
         self.commit_text();
         self.push_undo();
         let (w, h) = (self.width(), self.height());
-        let name = format!("Livello {}", self.layers.len() + 1);
+        let name = format!(
+            "{} {}",
+            tr(self.lang, "Livello", "Level"),
+            self.layers.len() + 1
+        );
         self.layers.insert(
             self.active + 1,
             Layer {
@@ -1160,24 +1204,32 @@ impl PaintApp {
         self.active += 1;
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Nuovo livello trasparente");
+        self.status = String::from(tr(
+            self.lang,
+            "Nuovo livello trasparente",
+            "New transparent layer",
+        ));
     }
 
     fn duplicate_layer(&mut self) {
         self.commit_text();
         self.push_undo();
         let mut copy = self.layers[self.active].clone();
-        copy.name = format!("{} copia", copy.name);
+        copy.name = format!("{} {}", copy.name, tr(self.lang, "copia", "copy"));
         self.layers.insert(self.active + 1, copy);
         self.active += 1;
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Livello duplicato");
+        self.status = String::from(tr(self.lang, "Livello duplicato", "Layer duplicated"));
     }
 
     fn delete_layer(&mut self) {
         if self.layers.len() <= 1 {
-            self.status = String::from("Serve almeno un livello");
+            self.status = String::from(tr(
+                self.lang,
+                "Serve almeno un livello",
+                "At least one layer is required",
+            ));
             return;
         }
         self.commit_text();
@@ -1186,7 +1238,7 @@ impl PaintApp {
         self.active = self.active.min(self.layers.len() - 1);
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Livello eliminato");
+        self.status = String::from(tr(self.lang, "Livello eliminato", "Layer deleted"));
     }
 
     fn move_layer(&mut self, up: bool) {
@@ -1211,7 +1263,11 @@ impl PaintApp {
 
     fn merge_down(&mut self) {
         if self.active == 0 {
-            self.status = String::from("Nessun livello sotto da unire");
+            self.status = String::from(tr(
+                self.lang,
+                "Nessun livello sotto da unire",
+                "No layer below to merge into",
+            ));
             return;
         }
         self.commit_text();
@@ -1223,7 +1279,11 @@ impl PaintApp {
         target.opacity = 1.0;
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Livello unito a quello sotto");
+        self.status = String::from(tr(
+            self.lang,
+            "Livello unito a quello sotto",
+            "Layer merged into the one below",
+        ));
     }
 
     fn flatten_layers(&mut self) {
@@ -1231,7 +1291,7 @@ impl PaintApp {
         self.push_undo();
         let image = self.composite();
         self.layers = vec![Layer {
-            name: String::from("Sfondo"),
+            name: String::from(tr(self.lang, "Sfondo", "Background")),
             image,
             visible: true,
             opacity: 1.0,
@@ -1239,7 +1299,7 @@ impl PaintApp {
         self.active = 0;
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Livelli appiattiti");
+        self.status = String::from(tr(self.lang, "Livelli appiattiti", "Layers flattened"));
     }
 
     // ----- selezione e appunti ------------------------------------------------
@@ -1268,7 +1328,7 @@ impl PaintApp {
     fn copy(&mut self) {
         if let Some(img) = self.selection_image() {
             self.set_clipboard(img);
-            self.status = String::from("Copiato");
+            self.status = String::from(tr(self.lang, "Copiato", "Copied"));
         }
     }
 
@@ -1300,7 +1360,7 @@ impl PaintApp {
         if self.selection.is_some() {
             self.copy();
             self.delete_selection();
-            self.status = String::from("Tagliato");
+            self.status = String::from(tr(self.lang, "Tagliato", "Cut"));
         }
     }
 
@@ -1312,7 +1372,7 @@ impl PaintApp {
                 RgbaImage::from_raw(d.width as u32, d.height as u32, d.bytes.into_owned())
             });
         let Some(img) = from_system.or_else(|| self.clipboard.clone()) else {
-            self.status = String::from("Appunti vuoti");
+            self.status = String::from(tr(self.lang, "Appunti vuoti", "Clipboard is empty"));
             return;
         };
         self.push_undo();
@@ -1327,7 +1387,11 @@ impl PaintApp {
         });
         self.tool = Tool::Select;
         self.dirty = true;
-        self.status = String::from("Incollato: trascina per spostare");
+        self.status = String::from(tr(
+            self.lang,
+            "Incollato: trascina per spostare",
+            "Pasted: drag to move",
+        ));
     }
 
     fn select_all(&mut self) {
@@ -1344,7 +1408,7 @@ impl PaintApp {
 
     fn crop_to_selection(&mut self) {
         let Some(sel) = self.selection.as_ref() else {
-            self.status = String::from("Nessuna selezione");
+            self.status = String::from(tr(self.lang, "Nessuna selezione", "No selection"));
             return;
         };
         let (x, y, w, h) = (sel.x, sel.y, sel.w, sel.h);
@@ -1355,7 +1419,7 @@ impl PaintApp {
         }
         self.selection = None;
         self.dirty = true;
-        self.status = String::from("Immagine ritagliata");
+        self.status = String::from(tr(self.lang, "Immagine ritagliata", "Image cropped"));
     }
 
     /// Solleva il contenuto della selezione: viene tolto dal livello e tenuto a parte.
@@ -1476,7 +1540,10 @@ impl PaintApp {
 
     fn open_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Immagini", &["png", "jpg", "jpeg", "bmp"])
+            .add_filter(
+                tr(self.lang, "Immagini", "Images"),
+                &["png", "jpg", "jpeg", "bmp"],
+            )
             .pick_file()
         else {
             return;
@@ -1490,7 +1557,7 @@ impl PaintApp {
                 let name = path
                     .file_stem()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("Sfondo")
+                    .unwrap_or(tr(self.lang, "Sfondo", "Background"))
                     .to_string();
                 self.layers = vec![Layer {
                     name,
@@ -1502,9 +1569,18 @@ impl PaintApp {
                 self.file_path = Some(path);
                 self.modified = false;
                 self.dirty = true;
-                self.status = String::from("Immagine aperta");
+                self.status = String::from(tr(self.lang, "Immagine aperta", "Image opened"));
             }
-            Err(e) => self.status = format!("Impossibile aprire il file: {e}"),
+            Err(e) => {
+                self.status = format!(
+                    "{} {e}",
+                    tr(
+                        self.lang,
+                        "Impossibile aprire il file:",
+                        "Could not open the file:"
+                    )
+                )
+            }
         }
     }
 
@@ -1520,7 +1596,7 @@ impl PaintApp {
             .add_filter("PNG", &["png"])
             .add_filter("JPEG", &["jpg", "jpeg"])
             .add_filter("Bitmap", &["bmp"])
-            .set_file_name("senza_titolo.png");
+            .set_file_name(tr(self.lang, "senza_titolo.png", "untitled.png"));
         if let Some(dir) = self.file_path.as_ref().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
@@ -1549,11 +1625,16 @@ impl PaintApp {
         };
         match result {
             Ok(()) => {
-                self.status = format!("Salvato: {}", path.display());
+                self.status = format!("{} {}", tr(self.lang, "Salvato:", "Saved:"), path.display());
                 self.file_path = Some(path);
                 self.modified = false;
             }
-            Err(e) => self.status = format!("Errore nel salvataggio: {e}"),
+            Err(e) => {
+                self.status = format!(
+                    "{} {e}",
+                    tr(self.lang, "Errore nel salvataggio:", "Save error:")
+                )
+            }
         }
     }
 
@@ -1921,25 +2002,75 @@ impl PaintApp {
     // ----- interfaccia: menu -------------------------------------------------------
 
     fn rotate_items(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Ruota di 90 gradi a destra").clicked() {
-            self.transform(imageops::rotate90, "Ruotata a destra");
+        if ui
+            .button(tr(
+                self.lang,
+                "Ruota di 90 gradi a destra",
+                "Rotate 90° clockwise",
+            ))
+            .clicked()
+        {
+            self.transform(
+                imageops::rotate90,
+                tr(self.lang, "Ruotata a destra", "Rotated 90° clockwise"),
+            );
             ui.close_menu();
         }
-        if ui.button("Ruota di 90 gradi a sinistra").clicked() {
-            self.transform(imageops::rotate270, "Ruotata a sinistra");
+        if ui
+            .button(tr(
+                self.lang,
+                "Ruota di 90 gradi a sinistra",
+                "Rotate 90° counter-clockwise",
+            ))
+            .clicked()
+        {
+            self.transform(
+                imageops::rotate270,
+                tr(
+                    self.lang,
+                    "Ruotata a sinistra",
+                    "Rotated 90° counter-clockwise",
+                ),
+            );
             ui.close_menu();
         }
-        if ui.button("Ruota di 180 gradi").clicked() {
-            self.transform(imageops::rotate180, "Ruotata di 180 gradi");
+        if ui
+            .button(tr(self.lang, "Ruota di 180 gradi", "Rotate 180°"))
+            .clicked()
+        {
+            self.transform(
+                imageops::rotate180,
+                tr(self.lang, "Ruotata di 180 gradi", "Rotated 180°"),
+            );
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("Capovolgi in orizzontale").clicked() {
-            self.transform(imageops::flip_horizontal, "Capovolta in orizzontale");
+        if ui
+            .button(tr(
+                self.lang,
+                "Capovolgi in orizzontale",
+                "Flip horizontally",
+            ))
+            .clicked()
+        {
+            self.transform(
+                imageops::flip_horizontal,
+                tr(
+                    self.lang,
+                    "Capovolta in orizzontale",
+                    "Flipped horizontally",
+                ),
+            );
             ui.close_menu();
         }
-        if ui.button("Capovolgi in verticale").clicked() {
-            self.transform(imageops::flip_vertical, "Capovolta in verticale");
+        if ui
+            .button(tr(self.lang, "Capovolgi in verticale", "Flip vertically"))
+            .clicked()
+        {
+            self.transform(
+                imageops::flip_vertical,
+                tr(self.lang, "Capovolta in verticale", "Flipped vertically"),
+            );
             ui.close_menu();
         }
     }
@@ -1964,21 +2095,30 @@ impl PaintApp {
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui
-                            .add(egui::Button::new("Nuovo...").shortcut_text("Ctrl+N"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Nuovo...", "New..."))
+                                    .shortcut_text("Ctrl+N"),
+                            )
                             .clicked()
                         {
                             self.new_dialog = Some((self.canvas().width(), self.canvas().height()));
                             ui.close_menu();
                         }
                         if ui
-                            .add(egui::Button::new("Apri...").shortcut_text("Ctrl+O"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Apri...", "Open..."))
+                                    .shortcut_text("Ctrl+O"),
+                            )
                             .clicked()
                         {
                             ui.close_menu();
                             self.open_file();
                         }
                         if ui
-                            .add(egui::Button::new("Salva").shortcut_text("Ctrl+S"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Salva", "Save"))
+                                    .shortcut_text("Ctrl+S"),
+                            )
                             .clicked()
                         {
                             ui.close_menu();
@@ -1986,8 +2126,8 @@ impl PaintApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new("Salva con nome...")
-                                    .shortcut_text("Ctrl+Maiusc+S"),
+                                egui::Button::new(tr(self.lang, "Salva con nome...", "Save as..."))
+                                    .shortcut_text(tr(self.lang, "Ctrl+Maiusc+S", "Ctrl+Shift+S")),
                             )
                             .clicked()
                         {
@@ -1995,15 +2135,16 @@ impl PaintApp {
                             self.save_as();
                         }
                         ui.separator();
-                        if ui.button("Esci").clicked() {
+                        if ui.button(tr(self.lang, "Esci", "Exit")).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
-                    ui.menu_button("Modifica", |ui| {
+                    ui.menu_button(tr(self.lang, "Modifica", "Edit"), |ui| {
                         if ui
                             .add_enabled(
                                 !self.undo.is_empty(),
-                                egui::Button::new("Annulla").shortcut_text("Ctrl+Z"),
+                                egui::Button::new(tr(self.lang, "Annulla", "Undo"))
+                                    .shortcut_text("Ctrl+Z"),
                             )
                             .clicked()
                         {
@@ -2013,7 +2154,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 !self.redo.is_empty(),
-                                egui::Button::new("Ripeti").shortcut_text("Ctrl+Y"),
+                                egui::Button::new(tr(self.lang, "Ripeti", "Redo"))
+                                    .shortcut_text("Ctrl+Y"),
                             )
                             .clicked()
                         {
@@ -2025,7 +2167,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Taglia").shortcut_text("Ctrl+X"),
+                                egui::Button::new(tr(self.lang, "Taglia", "Cut"))
+                                    .shortcut_text("Ctrl+X"),
                             )
                             .clicked()
                         {
@@ -2035,7 +2178,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Copia").shortcut_text("Ctrl+C"),
+                                egui::Button::new(tr(self.lang, "Copia", "Copy"))
+                                    .shortcut_text("Ctrl+C"),
                             )
                             .clicked()
                         {
@@ -2043,7 +2187,10 @@ impl PaintApp {
                             ui.close_menu();
                         }
                         if ui
-                            .add(egui::Button::new("Incolla").shortcut_text("Ctrl+V"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Incolla", "Paste"))
+                                    .shortcut_text("Ctrl+V"),
+                            )
                             .clicked()
                         {
                             self.paste();
@@ -2052,7 +2199,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Elimina").shortcut_text("Canc"),
+                                egui::Button::new(tr(self.lang, "Elimina", "Delete"))
+                                    .shortcut_text(tr(self.lang, "Canc", "Del")),
                             )
                             .clicked()
                         {
@@ -2061,56 +2209,78 @@ impl PaintApp {
                         }
                         ui.separator();
                         if ui
-                            .add(egui::Button::new("Seleziona tutto").shortcut_text("Ctrl+A"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Seleziona tutto", "Select all"))
+                                    .shortcut_text("Ctrl+A"),
+                            )
                             .clicked()
                         {
                             self.select_all();
                             ui.close_menu();
                         }
-                        if ui.button("Cancella tutto").clicked() {
+                        if ui
+                            .button(tr(self.lang, "Cancella tutto", "Clear all"))
+                            .clicked()
+                        {
                             self.clear();
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Immagine", |ui| {
+                    ui.menu_button(tr(self.lang, "Immagine", "Image"), |ui| {
                         if ui
                             .add_enabled(
                                 self.selection.is_some(),
-                                egui::Button::new("Ritaglia selezione"),
+                                egui::Button::new(tr(
+                                    self.lang,
+                                    "Ritaglia selezione",
+                                    "Crop selection",
+                                )),
                             )
                             .clicked()
                         {
                             self.crop_to_selection();
                             ui.close_menu();
                         }
-                        if ui.button("Ridimensiona...").clicked() {
+                        if ui
+                            .button(tr(self.lang, "Ridimensiona...", "Resize..."))
+                            .clicked()
+                        {
                             self.open_resize_dialog();
                             ui.close_menu();
                         }
                         ui.separator();
                         self.rotate_items(ui);
                         ui.separator();
-                        if ui.button("Inverti colori").clicked() {
+                        if ui
+                            .button(tr(self.lang, "Inverti colori", "Invert colors"))
+                            .clicked()
+                        {
                             self.invert_colors();
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Livello", |ui| {
+                    ui.menu_button(tr(self.lang, "Livello", "Layer"), |ui| {
                         if ui
-                            .add(egui::Button::new("Nuovo livello").shortcut_text("Ctrl+Maiusc+N"))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Nuovo livello", "New layer"))
+                                    .shortcut_text(tr(self.lang, "Ctrl+Maiusc+N", "Ctrl+Shift+N")),
+                            )
                             .clicked()
                         {
                             self.add_layer();
                             ui.close_menu();
                         }
-                        if ui.button("Duplica livello").clicked() {
+                        if ui
+                            .button(tr(self.lang, "Duplica livello", "Duplicate layer"))
+                            .clicked()
+                        {
                             self.duplicate_layer();
                             ui.close_menu();
                         }
                         if ui
                             .add_enabled(
                                 self.layers.len() > 1,
-                                egui::Button::new("Elimina livello"),
+                                egui::Button::new(tr(self.lang, "Elimina livello", "Delete layer")),
                             )
                             .clicked()
                         {
@@ -2121,7 +2291,7 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 self.active + 1 < self.layers.len(),
-                                egui::Button::new("Sposta su"),
+                                egui::Button::new(tr(self.lang, "Sposta su", "Move up")),
                             )
                             .clicked()
                         {
@@ -2129,7 +2299,10 @@ impl PaintApp {
                             ui.close_menu();
                         }
                         if ui
-                            .add_enabled(self.active > 0, egui::Button::new("Sposta giù"))
+                            .add_enabled(
+                                self.active > 0,
+                                egui::Button::new(tr(self.lang, "Sposta giù", "Move down")),
+                            )
                             .clicked()
                         {
                             self.move_layer(false);
@@ -2139,48 +2312,76 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 self.active > 0,
-                                egui::Button::new("Unisci al livello sotto"),
+                                egui::Button::new(tr(
+                                    self.lang,
+                                    "Unisci al livello sotto",
+                                    "Merge down",
+                                )),
                             )
                             .clicked()
                         {
                             self.merge_down();
                             ui.close_menu();
                         }
-                        if ui.button("Appiattisci tutto").clicked() {
+                        if ui
+                            .button(tr(self.lang, "Appiattisci tutto", "Flatten image"))
+                            .clicked()
+                        {
                             self.flatten_layers();
                             ui.close_menu();
                         }
                         ui.separator();
                         if ui
-                            .checkbox(&mut self.show_layers, "Mostra il pannello livelli")
+                            .checkbox(
+                                &mut self.show_layers,
+                                tr(self.lang, "Mostra il pannello livelli", "Show layers panel"),
+                            )
                             .clicked()
                         {
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Visualizza", |ui| {
-                        if ui.button("Ingrandisci").clicked() {
+                    ui.menu_button(tr(self.lang, "Visualizza", "View"), |ui| {
+                        if ui.button(tr(self.lang, "Ingrandisci", "Zoom in")).clicked() {
                             self.zoom = (self.zoom * 1.25).min(16.0);
                         }
-                        if ui.button("Riduci").clicked() {
+                        if ui.button(tr(self.lang, "Riduci", "Zoom out")).clicked() {
                             self.zoom = (self.zoom / 1.25).max(0.25);
                         }
-                        if ui.button("Zoom 100%").clicked() {
+                        if ui.button(tr(self.lang, "Zoom 100%", "Zoom 100%")).clicked() {
                             self.zoom = 1.0;
                             ui.close_menu();
                         }
                         ui.separator();
-                        ui.checkbox(&mut self.show_ruler, "Righello");
-                        ui.checkbox(&mut self.show_layers, "Pannello livelli");
-                        if ui.checkbox(&mut self.dark, "Tema scuro").changed() {
+                        ui.checkbox(&mut self.show_ruler, tr(self.lang, "Righello", "Ruler"));
+                        ui.checkbox(
+                            &mut self.show_layers,
+                            tr(self.lang, "Pannello livelli", "Layers panel"),
+                        );
+                        if ui
+                            .checkbox(&mut self.dark, tr(self.lang, "Tema scuro", "Dark theme"))
+                            .changed()
+                        {
                             setup_style(ctx, self.dark);
                         }
                     });
                     ui.menu_button("Info", |ui| {
-                        if ui.button(format!("Informazioni su {}", APP_NAME)).clicked() {
+                        if ui
+                            .button(format!(
+                                "{} {}",
+                                tr(self.lang, "Informazioni su", "About"),
+                                APP_NAME
+                            ))
+                            .clicked()
+                        {
                             self.about_open = true;
                             ui.close_menu();
                         }
+                    });
+                    ui.menu_button(tr(self.lang, "Impostazioni", "Settings"), |ui| {
+                        ui.strong(tr(self.lang, "Lingua", "Language"));
+                        ui.radio_value(&mut self.lang, Lang::It, "Italiano");
+                        ui.radio_value(&mut self.lang, Lang::En, "English");
                     });
                 });
             });
@@ -2211,10 +2412,13 @@ impl PaintApp {
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     // --- Appunti
-                    group(ui, "Appunti", |ui| {
+                    group(ui, tr(self.lang, "Appunti", "Clipboard"), |ui| {
                         let has_sel = self.selection.is_some();
                         if ui
-                            .add(egui::Button::new("Incolla").min_size(vec2(84.0, 24.0)))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Incolla", "Paste"))
+                                    .min_size(vec2(84.0, 24.0)),
+                            )
                             .clicked()
                         {
                             self.paste();
@@ -2222,7 +2426,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Taglia").min_size(vec2(84.0, 24.0)),
+                                egui::Button::new(tr(self.lang, "Taglia", "Cut"))
+                                    .min_size(vec2(84.0, 24.0)),
                             )
                             .clicked()
                         {
@@ -2231,7 +2436,8 @@ impl PaintApp {
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Copia").min_size(vec2(84.0, 24.0)),
+                                egui::Button::new(tr(self.lang, "Copia", "Copy"))
+                                    .min_size(vec2(84.0, 24.0)),
                             )
                             .clicked()
                         {
@@ -2240,34 +2446,39 @@ impl PaintApp {
                     });
 
                     // --- Immagine
-                    group(ui, "Immagine", |ui| {
+                    group(ui, tr(self.lang, "Immagine", "Image"), |ui| {
                         let has_sel = self.selection.is_some();
                         if ui
                             .add_enabled(
                                 has_sel,
-                                egui::Button::new("Ritaglia").min_size(vec2(104.0, 24.0)),
+                                egui::Button::new(tr(self.lang, "Ritaglia", "Crop"))
+                                    .min_size(vec2(104.0, 24.0)),
                             )
                             .clicked()
                         {
                             self.crop_to_selection();
                         }
                         if ui
-                            .add(egui::Button::new("Ridimensiona").min_size(vec2(104.0, 24.0)))
+                            .add(
+                                egui::Button::new(tr(self.lang, "Ridimensiona", "Resize"))
+                                    .min_size(vec2(104.0, 24.0)),
+                            )
                             .clicked()
                         {
                             self.open_resize_dialog();
                         }
-                        ui.menu_button("Ruota / Capovolgi", |ui| {
+                        ui.menu_button(tr(self.lang, "Ruota / Capovolgi", "Rotate / Flip"), |ui| {
                             self.rotate_items(ui);
                         });
                     });
 
                     // --- Strumenti
-                    group(ui, "Strumenti", |ui| {
+                    group(ui, tr(self.lang, "Strumenti", "Tools"), |ui| {
                         egui::Grid::new("tools_grid")
                             .spacing([2.0, 2.0])
                             .show(ui, |ui| {
-                                for (i, (tool, name)) in MAIN_TOOLS.iter().enumerate() {
+                                for (i, (tool, it, en)) in MAIN_TOOLS.iter().enumerate() {
+                                    let name = tr(self.lang, it, en);
                                     if tool_button(ui, self.tool == *tool, *tool, name, 34.0)
                                         .clicked()
                                     {
@@ -2281,9 +2492,10 @@ impl PaintApp {
                     });
 
                     // --- Forme
-                    group(ui, "Forme", |ui| {
+                    group(ui, tr(self.lang, "Forme", "Shapes"), |ui| {
                         ui.horizontal(|ui| {
-                            for (tool, name) in SHAPE_TOOLS.iter() {
+                            for (tool, it, en) in SHAPE_TOOLS.iter() {
+                                let name = tr(self.lang, it, en);
                                 if tool_button(ui, self.tool == *tool, *tool, name, 34.0).clicked()
                                 {
                                     self.tool = *tool;
@@ -2291,9 +2503,9 @@ impl PaintApp {
                             }
                         });
                         let current = match self.shape_mode {
-                            ShapeMode::Outline => "Contorno",
-                            ShapeMode::Filled => "Pieno",
-                            ShapeMode::Both => "Contorno + pieno",
+                            ShapeMode::Outline => tr(self.lang, "Contorno", "Outline"),
+                            ShapeMode::Filled => tr(self.lang, "Pieno", "Filled"),
+                            ShapeMode::Both => tr(self.lang, "Contorno + pieno", "Outline + fill"),
                         };
                         egui::ComboBox::from_id_salt("shape_mode")
                             .width(100.0)
@@ -2302,53 +2514,70 @@ impl PaintApp {
                                 ui.selectable_value(
                                     &mut self.shape_mode,
                                     ShapeMode::Outline,
-                                    "Contorno",
+                                    tr(self.lang, "Contorno", "Outline"),
                                 );
                                 ui.selectable_value(
                                     &mut self.shape_mode,
                                     ShapeMode::Filled,
-                                    "Pieno",
+                                    tr(self.lang, "Pieno", "Filled"),
                                 );
                                 ui.selectable_value(
                                     &mut self.shape_mode,
                                     ShapeMode::Both,
-                                    "Contorno + pieno",
+                                    tr(self.lang, "Contorno + pieno", "Outline + fill"),
                                 );
                             });
                     });
 
                     // --- Dimensione
-                    group(ui, "Dimensione", |ui| {
+                    group(ui, tr(self.lang, "Dimensione", "Size"), |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Spessore");
+                            ui.label(tr(self.lang, "Spessore", "Width"));
                             ui.add(egui::Slider::new(&mut self.size, 1..=64));
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Testo      ");
+                            ui.label(tr(self.lang, "Testo      ", "Text       "));
                             ui.add(egui::Slider::new(&mut self.text_size, 8..=200));
                         });
-                        ui.checkbox(&mut self.eraser_transparent, "Gomma trasparente");
+                        ui.checkbox(
+                            &mut self.eraser_transparent,
+                            tr(self.lang, "Gomma trasparente", "Transparent eraser"),
+                        );
                         ui.horizontal(|ui| {
-                            ui.label("Fluidità");
+                            ui.label(tr(self.lang, "Fluidità", "Smudge strength"));
                             ui.add(egui::Slider::new(&mut self.smudge, 0.05..=1.0).max_decimals(2));
                         });
                     });
 
                     // --- Colori
-                    group(ui, "Colori", |ui| {
+                    group(ui, tr(self.lang, "Colori", "Colors"), |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.color_edit_button_srgb(&mut self.primary)
-                                        .on_hover_text("Colore 1 (clic sinistro)");
-                                    ui.label(egui::RichText::new("Colore 1").small());
+                                        .on_hover_text(tr(
+                                            self.lang,
+                                            "Colore 1 (clic sinistro)",
+                                            "Color 1 (left click)",
+                                        ));
+                                    ui.label(
+                                        egui::RichText::new(tr(self.lang, "Colore 1", "Color 1"))
+                                            .small(),
+                                    );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.color_edit_button_srgb(&mut self.secondary)
-                                        .on_hover_text("Colore 2 (clic destro)");
-                                    ui.label(egui::RichText::new("Colore 2").small());
+                                        .on_hover_text(tr(
+                                            self.lang,
+                                            "Colore 2 (clic destro)",
+                                            "Color 2 (right click)",
+                                        ));
+                                    ui.label(
+                                        egui::RichText::new(tr(self.lang, "Colore 2", "Color 2"))
+                                            .small(),
+                                    );
                                 });
-                                if ui.small_button("Scambia").clicked() {
+                                if ui.small_button(tr(self.lang, "Scambia", "Swap")).clicked() {
                                     std::mem::swap(&mut self.primary, &mut self.secondary);
                                 }
                             });
@@ -2363,7 +2592,11 @@ impl PaintApp {
                                                     .rounding(4.0)
                                                     .min_size(Vec2::splat(20.0)),
                                             )
-                                            .on_hover_text("Sinistro: colore 1 - Destro: colore 2");
+                                            .on_hover_text(tr(
+                                                self.lang,
+                                                "Sinistro: colore 1 - Destro: colore 2",
+                                                "Left: color 1 - Right: color 2",
+                                            ));
                                         if resp.clicked() {
                                             self.primary = *c;
                                         }
@@ -2391,12 +2624,21 @@ impl PaintApp {
                 }
                 ui.separator();
                 if let Some(s) = &self.selection {
-                    ui.label(format!("Selezione: {} x {} px", s.w, s.h));
+                    ui.label(format!(
+                        "{} {} x {} px",
+                        tr(self.lang, "Selezione:", "Selection:"),
+                        s.w,
+                        s.h
+                    ));
                     ui.separator();
                 }
                 ui.label(format!("{} x {} px", self.width(), self.height()));
                 ui.separator();
-                ui.label(format!("Livelli: {}", self.layers.len()));
+                ui.label(format!(
+                    "{} {}",
+                    tr(self.lang, "Livelli:", "Layers:"),
+                    self.layers.len()
+                ));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("100%").clicked() {
@@ -2408,7 +2650,7 @@ impl PaintApp {
                             .max_decimals(2)
                             .suffix("x"),
                     );
-                    ui.label("Zoom");
+                    ui.label(tr(self.lang, "Zoom", "Zoom"));
                     ui.separator();
                     ui.label(self.status.as_str());
                 });
@@ -2426,7 +2668,11 @@ impl PaintApp {
         self.selection = None;
         self.active = index;
         self.dirty = true;
-        self.status = format!("Livello: {}", self.layers[index].name);
+        self.status = format!(
+            "{} {}",
+            tr(self.lang, "Livello:", "Layer:"),
+            self.layers[index].name
+        );
     }
 
     fn layers_panel(&mut self, ctx: &egui::Context) {
@@ -2440,9 +2686,9 @@ impl PaintApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.strong("Livelli");
+                    ui.strong(tr(self.lang, "Livelli", "Layers"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Nascondi").clicked() {
+                        if ui.small_button(tr(self.lang, "Nascondi", "Hide")).clicked() {
                             self.show_layers = false;
                         }
                     });
@@ -2463,7 +2709,11 @@ impl PaintApp {
                                 let mut visible = self.layers[i].visible;
                                 if ui
                                     .checkbox(&mut visible, "")
-                                    .on_hover_text("Mostra o nascondi il livello")
+                                    .on_hover_text(tr(
+                                        self.lang,
+                                        "Mostra o nascondi il livello",
+                                        "Show or hide the layer",
+                                    ))
                                     .changed()
                                 {
                                     toggle = Some(i);
@@ -2492,7 +2742,7 @@ impl PaintApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Opacità");
+                    ui.label(tr(self.lang, "Opacità", "Opacity"));
                     let mut opacity = self.layers[self.active].opacity;
                     if ui
                         .add(egui::Slider::new(&mut opacity, 0.0..=1.0).max_decimals(2))
@@ -2503,7 +2753,7 @@ impl PaintApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Nome");
+                    ui.label(tr(self.lang, "Nome", "Name"));
                     let mut name = self.layers[self.active].name.clone();
                     if ui.text_edit_singleline(&mut name).changed() {
                         self.layers[self.active].name = name;
@@ -2512,28 +2762,43 @@ impl PaintApp {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     if ui
-                        .button("Nuovo")
-                        .on_hover_text("Nuovo livello trasparente (Ctrl+Maiusc+N)")
+                        .button(tr(self.lang, "Nuovo", "New"))
+                        .on_hover_text(tr(
+                            self.lang,
+                            "Nuovo livello trasparente (Ctrl+Maiusc+N)",
+                            "New transparent layer (Ctrl+Shift+N)",
+                        ))
                         .clicked()
                     {
                         self.add_layer();
                     }
-                    if ui.button("Duplica").clicked() {
+                    if ui.button(tr(self.lang, "Duplica", "Duplicate")).clicked() {
                         self.duplicate_layer();
                     }
-                    if ui.button("Elimina").clicked() {
+                    if ui.button(tr(self.lang, "Elimina", "Delete")).clicked() {
                         self.delete_layer();
                     }
-                    if ui.button("Su").on_hover_text("Sposta su").clicked() {
+                    if ui
+                        .button(tr(self.lang, "Su", "Up"))
+                        .on_hover_text(tr(self.lang, "Sposta su", "Move up"))
+                        .clicked()
+                    {
                         self.move_layer(true);
                     }
-                    if ui.button("Giù").on_hover_text("Sposta giù").clicked() {
+                    if ui
+                        .button(tr(self.lang, "Giù", "Down"))
+                        .on_hover_text(tr(self.lang, "Sposta giù", "Move down"))
+                        .clicked()
+                    {
                         self.move_layer(false);
                     }
-                    if ui.button("Unisci sotto").clicked() {
+                    if ui
+                        .button(tr(self.lang, "Unisci sotto", "Merge down"))
+                        .clicked()
+                    {
                         self.merge_down();
                     }
-                    if ui.button("Appiattisci").clicked() {
+                    if ui.button(tr(self.lang, "Appiattisci", "Flatten")).clicked() {
                         self.flatten_layers();
                     }
                 });
@@ -2722,7 +2987,11 @@ impl PaintApp {
             size0,
             last: size0,
         });
-        self.status = String::from("Trascina il margine per cambiare il foglio");
+        self.status = String::from(tr(
+            self.lang,
+            "Trascina il margine per cambiare il foglio",
+            "Drag the edge to resize the canvas",
+        ));
     }
 
     fn drag_canvas_resize(&mut self, pointer: Pos2, origin: Pos2) {
@@ -2753,7 +3022,7 @@ impl PaintApp {
             drag.last = (w, h);
         }
         self.dirty = true;
-        self.status = format!("Foglio: {w} x {h} px");
+        self.status = format!("{} {w} x {h} px", tr(self.lang, "Foglio:", "Canvas:"));
     }
 
     fn end_canvas_resize(&mut self) {
@@ -2765,7 +3034,12 @@ impl PaintApp {
             self.undo.pop();
         } else {
             self.modified = true;
-            self.status = format!("Foglio: {} x {} px", drag.last.0, drag.last.1);
+            self.status = format!(
+                "{} {} x {} px",
+                tr(self.lang, "Foglio:", "Canvas:"),
+                drag.last.0,
+                drag.last.1
+            );
         }
     }
 
@@ -2919,7 +3193,7 @@ impl PaintApp {
         let mut changed = false;
 
         if let Some(te) = &mut self.text_edit {
-            egui::Window::new("Testo")
+            egui::Window::new(tr(self.lang, "Testo", "Text"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, -40.0))
@@ -2928,7 +3202,7 @@ impl PaintApp {
                         egui::TextEdit::multiline(&mut te.content)
                             .desired_rows(3)
                             .desired_width(260.0)
-                            .hint_text("Scrivi qui..."),
+                            .hint_text(tr(self.lang, "Scrivi qui...", "Type here...")),
                     );
                     if te.focus {
                         resp.request_focus();
@@ -2939,22 +3213,26 @@ impl PaintApp {
                     }
                     let before = self.text_size;
                     ui.horizontal(|ui| {
-                        ui.label("Dimensione");
+                        ui.label(tr(self.lang, "Dimensione", "Size"));
                         ui.add(egui::Slider::new(&mut self.text_size, 8..=200));
                     });
                     if self.text_size != before {
                         changed = true;
                     }
                     ui.label(
-                        egui::RichText::new("Clic sulla tela per spostare il testo")
-                            .small()
-                            .weak(),
+                        egui::RichText::new(tr(
+                            self.lang,
+                            "Clic sulla tela per spostare il testo",
+                            "Click on the canvas to move the text",
+                        ))
+                        .small()
+                        .weak(),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("Applica").clicked() {
+                        if ui.button(tr(self.lang, "Applica", "Apply")).clicked() {
                             action = Some(true);
                         }
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(tr(self.lang, "Annulla", "Cancel")).clicked() {
                             action = Some(false);
                         }
                     });
@@ -2975,25 +3253,25 @@ impl PaintApp {
         let mut action: Option<bool> = None;
 
         if let Some((w, h)) = &mut self.new_dialog {
-            egui::Window::new("Nuova immagine")
+            egui::Window::new(tr(self.lang, "Nuova immagine", "New image"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Larghezza:");
+                        ui.label(tr(self.lang, "Larghezza:", "Width:"));
                         ui.add(egui::DragValue::new(w).range(1..=8192).suffix(" px"));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Altezza:    ");
+                        ui.label(tr(self.lang, "Altezza:    ", "Height:    "));
                         ui.add(egui::DragValue::new(h).range(1..=8192).suffix(" px"));
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Crea").clicked() {
+                        if ui.button(tr(self.lang, "Crea", "Create")).clicked() {
                             action = Some(true);
                         }
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(tr(self.lang, "Annulla", "Cancel")).clicked() {
                             action = Some(false);
                         }
                     });
@@ -3013,19 +3291,22 @@ impl PaintApp {
         let mut action: Option<bool> = None;
 
         if let Some(d) = &mut self.resize_dialog {
-            egui::Window::new("Ridimensiona immagine")
+            egui::Window::new(tr(self.lang, "Ridimensiona immagine", "Resize image"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.checkbox(&mut d.keep_ratio, "Mantieni le proporzioni");
+                    ui.checkbox(
+                        &mut d.keep_ratio,
+                        tr(self.lang, "Mantieni le proporzioni", "Keep proportions"),
+                    );
                     let (w0, h0) = (d.w, d.h);
                     ui.horizontal(|ui| {
-                        ui.label("Larghezza:");
+                        ui.label(tr(self.lang, "Larghezza:", "Width:"));
                         ui.add(egui::DragValue::new(&mut d.w).range(1..=8192).suffix(" px"));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Altezza:    ");
+                        ui.label(tr(self.lang, "Altezza:    ", "Height:    "));
                         ui.add(egui::DragValue::new(&mut d.h).range(1..=8192).suffix(" px"));
                     });
                     if d.keep_ratio {
@@ -3037,10 +3318,10 @@ impl PaintApp {
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Applica").clicked() {
+                        if ui.button(tr(self.lang, "Applica", "Apply")).clicked() {
                             action = Some(true);
                         }
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(tr(self.lang, "Annulla", "Cancel")).clicked() {
                             action = Some(false);
                         }
                     });
@@ -3062,34 +3343,41 @@ impl PaintApp {
         }
         let mut open = true;
         let mut close_clicked = false;
-        egui::Window::new(format!("Informazioni su {}", APP_NAME))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_max_width(380.0);
-                ui.add_space(4.0);
-                ui.heading(APP_NAME);
-                ui.add_space(6.0);
-                egui::Grid::new("about_grid")
-                    .num_columns(2)
-                    .spacing([14.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Nome del programma").weak());
-                        ui.label(APP_NAME);
-                        ui.end_row();
-                        ui.label(egui::RichText::new("Versione").weak());
-                        ui.label(APP_VERSION);
-                        ui.end_row();
-                    });
-                ui.add_space(8.0);
-                ui.label(APP_DESCRIPTION);
-                ui.add_space(10.0);
-                if ui.button("Chiudi").clicked() {
-                    close_clicked = true;
-                }
-            });
+        egui::Window::new(format!(
+            "{} {}",
+            tr(self.lang, "Informazioni su", "About"),
+            APP_NAME
+        ))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.add_space(4.0);
+            ui.heading(APP_NAME);
+            ui.add_space(6.0);
+            egui::Grid::new("about_grid")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(tr(self.lang, "Nome del programma", "Program name"))
+                            .weak(),
+                    );
+                    ui.label(APP_NAME);
+                    ui.end_row();
+                    ui.label(egui::RichText::new(tr(self.lang, "Versione", "Version")).weak());
+                    ui.label(APP_VERSION);
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            ui.label(tr(self.lang, APP_DESCRIPTION, APP_DESCRIPTION_EN));
+            ui.add_space(10.0);
+            if ui.button(tr(self.lang, "Chiudi", "Close")).clicked() {
+                close_clicked = true;
+            }
+        });
         if !open || close_clicked {
             self.about_open = false;
         }
@@ -3101,7 +3389,7 @@ impl PaintApp {
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or("Senza titolo");
+            .unwrap_or(tr(self.lang, "Senza titolo", "Untitled"));
         let title = format!(
             "{}{} - {}",
             name,
