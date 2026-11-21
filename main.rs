@@ -3647,19 +3647,16 @@ impl eframe::App for PaintApp {
 
 fn main() -> eframe::Result<()> {
     let settings = Settings::load();
-    let mut viewport = if settings.maximized {
-        egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1040.0, 520.0])
-            .with_maximized(true)
-            .with_position(egui::pos2(-10000.0, -10000.0))
-            .with_title(format!("Senza titolo - {}", APP_NAME))
-    } else {
-        egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1040.0, 520.0])
-            .with_title(format!("Senza titolo - {}", APP_NAME))
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([1040.0, 520.0])
+        .with_title(format!("Senza titolo - {}", APP_NAME));
+    if settings.maximized {
+        // La finestra viene creata gia' massimizzata da winit, quindi appare a
+        // schermo intero senza il passaggio da finestra normale. Non va
+        // spostata fuori schermo: in quel caso restava invisibile.
+        viewport = viewport.with_maximized(true);
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
