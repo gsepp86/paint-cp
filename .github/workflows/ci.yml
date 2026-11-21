@@ -70,5 +70,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.exe
-          generate_release_notes: true
+          # Le note vengono dal file, cosi' la descrizione delle funzioni non si
+          # mescola con il changelog generato a ogni build.
+          body_path: RELEASE_NOTES.md
 
