@@ -43,6 +43,18 @@ trasparenza e cronologia. È gratis, senza pubblicità e senza account.
 - Sezione Info con il tasto **Controlla aggiornamenti**: interroga GitHub e dice se è
   uscita una versione nuova, con il collegamento diretto al download
 
+### Novità di questa versione
+
+- Sezione Info: nuovo tasto **Controlla aggiornamenti**, che dice se è uscita una
+  versione nuova e porta al download (la richiesta gira in background, senza bloccare
+  la finestra).
+- L'opzione "Apri sempre massimizzato" è stata rimossa: su alcuni PC la finestra si
+  apriva trasparente e non era più utilizzabile.
+- All'avvio l'app si apre in una finestra un po' più compatta, centrata sullo schermo.
+- Nuova icona a goccia multicolore.
+- README con la descrizione completa di tutte le funzioni e delle scorciatoie da
+  tastiera.
+
 **Download:** `PaintCP-Setup-1.3.exe` (installer per Windows) oppure `paint_cp.exe`
 (eseguibile singolo, senza installazione).
 
