@@ -6,6 +6,10 @@ trasparenza e cronologia. È gratis, senza pubblicità e senza account. Puoi **s
 progetto** con tutti i livelli in un file `.pcp`, per riaprirlo e continuare a
 modificarlo quando vuoi.
 
+### Se vuoi contribuire al mio lavoro visto il tempo che ti farò risparmiare quando stampi tanti file ti lascio in basso il pulsante per contribuire anche con una piccola donazione simbolica visto che una app così utile gratis per sempre non la trovi ovunque apprezzo il gesto ;-)
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?logo=paypal)](https://paypal.me/PeppeCP)
+
 ### Funzioni
 
 **Disegno e ritocco**
