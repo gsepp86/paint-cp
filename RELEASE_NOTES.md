@@ -2,7 +2,9 @@
 
 Paint CP è un programma di disegno e fotoritocco leggero, pensato per Windows (funziona
 anche su Linux e macOS): semplice come il vecchio Paint, ma con livelli, selezione,
-trasparenza e cronologia. È gratis, senza pubblicità e senza account.
+trasparenza e cronologia. È gratis, senza pubblicità e senza account. Puoi **salvare il
+progetto** con tutti i livelli in un file `.pcp`, per riaprirlo e continuare a
+modificarlo quando vuoi.
 
 ### Funzioni
 
@@ -29,8 +31,14 @@ trasparenza e cronologia. È gratis, senza pubblicità e senza account.
 - Rotazione di 90° a destra e a sinistra, capovolgimento orizzontale e verticale
 - Inversione dei colori
 
-**File**
-- Apre PNG, JPG/JPEG e BMP; salva in PNG, JPEG e BMP
+**File e progetti**
+- Apre PNG, JPG/JPEG e BMP; salva l'immagine finale in PNG, JPEG e BMP
+- **Salva il progetto** in un file `.pcp` con tutti i livelli (nome, visibilità,
+  opacità) e il livello attivo, per riprendere il lavoro e modificarlo in futuro
+- Voci **File → Apri progetto...** e **File → Salva progetto...**; il formato progetto
+  è disponibile anche in "Salva con nome..."
+- Da un progetto si esporta un'immagine senza perdere i livelli: il progetto resta il
+  file di lavoro
 - "Salva" e "Salva con nome", con il nome del file e l'asterisco di modifica non salvata
   nella barra del titolo
 
@@ -45,6 +53,9 @@ trasparenza e cronologia. È gratis, senza pubblicità e senza account.
 
 ### Novità di questa versione
 
+- **Salvataggio del progetto**: oltre all'immagine, si può salvare il lavoro in un file
+  `.pcp` con tutti i livelli (nome, visibilità, opacità) e riaprirlo in seguito per
+  continuare a modificarlo.
 - Sezione Info: nuovo tasto **Controlla aggiornamenti**, che dice se è uscita una
   versione nuova e porta al download (la richiesta gira in background, senza bloccare
   la finestra).
@@ -64,5 +75,6 @@ trasparenza e cronologia. È gratis, senza pubblicità e senza account.
 and macOS). Features: brush, pencil, eraser, spray, smudge, fill, color picker, text and
 shapes; rectangular selection with cut/copy/paste and crop; multiple layers with opacity,
 merge and flatten; new image, resize, rotate and flip; PNG/JPEG/BMP open and save;
-undo/redo; zoom and ruler; Italian/English interface with light and dark themes; and a
-"Check for updates" button in the Info dialog.
+**project files (`.pcp`) that keep every layer so you can reopen the work and edit it
+later**; undo/redo; zoom and ruler; Italian/English interface with light and dark themes;
+and a "Check for updates" button in the Info dialog.

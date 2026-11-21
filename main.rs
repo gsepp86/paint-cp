@@ -11,7 +11,8 @@ use eframe::egui::{
     self, pos2, vec2, Align2, Color32, CursorIcon, Key, Modifiers, PointerButton, Pos2, Rect,
     Rounding, Sense, Stroke, TextureFilter, TextureHandle, TextureOptions, Vec2,
 };
-use image::{imageops, DynamicImage, Rgba, RgbaImage};
+use image::codecs::png::{PngDecoder, PngEncoder};
+use image::{imageops, DynamicImage, ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
 
 const MAX_UNDO: usize = 20;
 /// Limite di memoria della cronologia: oltre questo si scartano i passi piu' vecchi.
@@ -27,8 +28,8 @@ const ACCENT: Color32 = Color32::from_rgb(0, 103, 192);
 
 const APP_NAME: &str = "Paint CP";
 const APP_VERSION: &str = "1.3";
-const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
-const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
+const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA. Puoi salvare il progetto in un file .pcp con tutti i livelli, per riaprirlo e continuare a modificarlo quando vuoi.";
+const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI. You can save the project to a .pcp file with all its layers, so you can reopen it and keep working on it later.";
 /// Pagina da cui l'app controlla qual e' l'ultima versione pubblicata.
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/gsepp86/paint-cp/releases/latest";
 /// Pagina delle release aperta quando c'e' una versione nuova o il controllo fallisce.
@@ -1085,6 +1086,149 @@ fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 // ---------------------------------------------------------------------------
+// File di progetto (.pcp): tela, livelli, visibilita' e opacita'
+// ---------------------------------------------------------------------------
+
+/// Estensione dei file di progetto, che conservano i livelli per riprenderli dopo.
+const PROJECT_EXT: &str = "pcp";
+const PROJECT_MAGIC: &[u8; 8] = b"PaintCP\0";
+/// Versione del formato scritta nel file: si legge anche se e' piu' vecchia.
+const PROJECT_FORMAT: u16 = 1;
+
+fn is_project_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT))
+}
+
+/// Comprime il livello in PNG per tenerlo dentro il file di progetto.
+fn layer_to_png(img: &RgbaImage) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    PngEncoder::new(&mut data)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(data)
+}
+
+fn layer_from_png(data: &[u8]) -> Result<RgbaImage, String> {
+    let decoder = PngDecoder::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    Ok(img.to_rgba8())
+}
+
+/// Lettore sequenziale dei campi del file di progetto.
+struct ProjectReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ProjectReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or("file di progetto non valido")?;
+        let bytes = self
+            .data
+            .get(self.pos..end)
+            .ok_or("file di progetto incompleto")?;
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn f32(&mut self) -> Result<f32, String> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn text(&mut self) -> Result<String, String> {
+        let len = self.u32()? as usize;
+        let bytes = self.take(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+    }
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Scrive il progetto (livelli compresi) in un buffer pronto per il disco.
+fn encode_project(layers: &[Layer], active: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(PROJECT_MAGIC);
+    out.extend_from_slice(&PROJECT_FORMAT.to_le_bytes());
+    push_u32(&mut out, layers.len() as u32);
+    push_u32(&mut out, active as u32);
+    for layer in layers {
+        let png = layer_to_png(&layer.image)?;
+        let name = layer.name.as_bytes();
+        push_u32(&mut out, name.len() as u32);
+        out.extend_from_slice(name);
+        out.push(u8::from(layer.visible));
+        out.extend_from_slice(&layer.opacity.to_le_bytes());
+        push_u32(&mut out, png.len() as u32);
+        out.extend_from_slice(&png);
+    }
+    Ok(out)
+}
+
+/// Legge un progetto salvato: livelli nell'ordine originale e livello attivo.
+fn decode_project(data: &[u8]) -> Result<(Vec<Layer>, usize), String> {
+    let mut reader = ProjectReader::new(data);
+    if reader.take(PROJECT_MAGIC.len())? != &PROJECT_MAGIC[..] {
+        return Err(String::from("non e' un progetto di Paint CP"));
+    }
+    let format = reader.u16()?;
+    if format > PROJECT_FORMAT {
+        return Err(format!("versione del progetto non supportata ({format})"));
+    }
+    let count = reader.u32()? as usize;
+    if count == 0 || count > 512 {
+        return Err(String::from("numero di livelli non valido"));
+    }
+    let active = reader.u32()? as usize;
+    let mut layers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = reader.text()?;
+        let visible = reader.u8()? != 0;
+        let opacity = reader.f32()?.clamp(0.0, 1.0);
+        let len = reader.u32()? as usize;
+        let image = layer_from_png(reader.take(len)?)?;
+        layers.push(Layer {
+            name,
+            image,
+            visible,
+            opacity,
+        });
+    }
+    let last = layers.len() - 1;
+    Ok((layers, active.min(last)))
+}
+
+// ---------------------------------------------------------------------------
 // Applicazione
 // ---------------------------------------------------------------------------
 
@@ -1710,10 +1854,83 @@ impl PaintApp {
                 tr(self.lang, "Immagini", "Images"),
                 &["png", "jpg", "jpeg", "bmp"],
             )
+            .add_filter(
+                tr(self.lang, "Progetto Paint CP", "Paint CP project"),
+                &[PROJECT_EXT],
+            )
             .pick_file()
         else {
             return;
         };
+        self.open_path(path);
+    }
+
+    /// Apre il file scelto: un progetto .pcp oppure un'immagine.
+    fn open_path(&mut self, path: PathBuf) {
+        if is_project_path(&path) {
+            self.open_project_path(path);
+        } else {
+            self.open_image_path(path);
+        }
+    }
+
+    /// "Apri progetto...": solo file .pcp, con i livelli salvati in precedenza.
+    fn open_project(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                tr(self.lang, "Progetto Paint CP", "Paint CP project"),
+                &[PROJECT_EXT],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        self.open_path(path);
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) => {
+                self.status = format!(
+                    "{} {e}",
+                    tr(
+                        self.lang,
+                        "Impossibile aprire il progetto:",
+                        "Could not open the project:"
+                    )
+                );
+                return;
+            }
+        };
+        match decode_project(&data) {
+            Ok((layers, active)) => {
+                self.push_undo();
+                self.selection = None;
+                self.has_alpha = layers
+                    .iter()
+                    .any(|l| l.image.pixels().any(|p| p.0[3] < 255));
+                self.layers = layers;
+                self.active = active;
+                self.file_path = Some(path);
+                self.modified = false;
+                self.dirty = true;
+                self.status = String::from(tr(self.lang, "Progetto aperto", "Project opened"));
+            }
+            Err(e) => {
+                self.status = format!(
+                    "{} {e}",
+                    tr(
+                        self.lang,
+                        "Impossibile aprire il progetto:",
+                        "Could not open the project:"
+                    )
+                )
+            }
+        }
+    }
+
+    fn open_image_path(&mut self, path: PathBuf) {
         match image::open(&path) {
             Ok(img) => {
                 let rgba_img = img.to_rgba8();
@@ -1759,6 +1976,10 @@ impl PaintApp {
 
     fn save_as(&mut self) {
         let mut dialog = rfd::FileDialog::new()
+            .add_filter(
+                tr(self.lang, "Progetto Paint CP", "Paint CP project"),
+                &[PROJECT_EXT],
+            )
             .add_filter("PNG", &["png"])
             .add_filter("JPEG", &["jpg", "jpeg"])
             .add_filter("Bitmap", &["bmp"])
@@ -1771,11 +1992,62 @@ impl PaintApp {
         }
     }
 
-    fn save_to(&mut self, mut path: PathBuf) {
+    /// "Salva progetto...": conserva i livelli per riprendere il lavoro dopo.
+    fn save_project_as(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter(
+                tr(self.lang, "Progetto Paint CP", "Paint CP project"),
+                &[PROJECT_EXT],
+            )
+            .set_file_name(tr(self.lang, "senza_titolo.pcp", "untitled.pcp"));
+        if let Some(dir) = self.file_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.save_file() {
+            self.save_project_to(path);
+        }
+    }
+
+    fn save_project_to(&mut self, mut path: PathBuf) {
         self.commit_text();
         if path.extension().is_none() {
-            path.set_extension("png");
+            path.set_extension(PROJECT_EXT);
         }
+        let written = encode_project(&self.layers, self.active)
+            .and_then(|data| std::fs::write(&path, data).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => {
+                self.status = format!(
+                    "{} {}",
+                    tr(self.lang, "Progetto salvato:", "Project saved:"),
+                    path.display()
+                );
+                self.file_path = Some(path);
+                self.modified = false;
+            }
+            Err(e) => {
+                self.status = format!(
+                    "{} {e}",
+                    tr(self.lang, "Errore nel salvataggio:", "Save error:")
+                )
+            }
+        }
+    }
+
+    fn save_to(&mut self, mut path: PathBuf) {
+        let current_is_project = self.file_path.as_ref().is_some_and(|p| is_project_path(p));
+        if path.extension().is_none() {
+            path.set_extension(if current_is_project {
+                PROJECT_EXT
+            } else {
+                "png"
+            });
+        }
+        if is_project_path(&path) {
+            self.save_project_to(path);
+            return;
+        }
+        self.commit_text();
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -1791,9 +2063,20 @@ impl PaintApp {
         };
         match result {
             Ok(()) => {
-                self.status = format!("{} {}", tr(self.lang, "Salvato:", "Saved:"), path.display());
-                self.file_path = Some(path);
-                self.modified = false;
+                if current_is_project {
+                    // Da un progetto si esporta un'immagine: il progetto resta
+                    // il file di lavoro, quindi non si perdono i livelli.
+                    self.status = format!(
+                        "{} {}",
+                        tr(self.lang, "Immagine esportata:", "Image exported:"),
+                        path.display()
+                    );
+                } else {
+                    self.status =
+                        format!("{} {}", tr(self.lang, "Salvato:", "Saved:"), path.display());
+                    self.file_path = Some(path);
+                    self.modified = false;
+                }
             }
             Err(e) => {
                 self.status = format!(
@@ -2299,6 +2582,29 @@ impl PaintApp {
                         {
                             ui.close_menu();
                             self.save_as();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(egui::Button::new(tr(
+                                self.lang,
+                                "Apri progetto...",
+                                "Open project...",
+                            )))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.open_project();
+                        }
+                        if ui
+                            .add(egui::Button::new(tr(
+                                self.lang,
+                                "Salva progetto...",
+                                "Save project...",
+                            )))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.save_project_as();
                         }
                         ui.separator();
                         if ui.button(tr(self.lang, "Esci", "Exit")).clicked() {
@@ -3795,4 +4101,49 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PaintApp::new(&cc.egui_ctx)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Il giro completo scrittura/lettura deve restituire i livelli com'erano.
+    #[test]
+    fn il_progetto_conserva_i_livelli() {
+        let mut sfondo = RgbaImage::from_pixel(4, 3, rgba(WHITE));
+        sfondo.put_pixel(1, 1, rgba(BLACK));
+        let alto = RgbaImage::from_pixel(4, 3, Rgba([10, 20, 30, 128]));
+        let layers = vec![
+            Layer {
+                name: String::from("Sfondo"),
+                image: sfondo,
+                visible: true,
+                opacity: 1.0,
+            },
+            Layer {
+                name: String::from("Livello 2"),
+                image: alto,
+                visible: false,
+                opacity: 0.5,
+            },
+        ];
+
+        let data = encode_project(&layers, 1).expect("scrittura del progetto");
+        let (restored, active) = decode_project(&data).expect("lettura del progetto");
+
+        assert_eq!(active, 1);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].name, "Sfondo");
+        assert_eq!(restored[1].name, "Livello 2");
+        assert!(restored[0].visible);
+        assert!(!restored[1].visible);
+        assert_eq!(restored[1].opacity, 0.5);
+        assert_eq!(restored[0].image.as_raw(), layers[0].image.as_raw());
+        assert_eq!(restored[1].image.as_raw(), layers[1].image.as_raw());
+    }
+
+    #[test]
+    fn un_file_qualsiasi_non_e_un_progetto() {
+        assert!(decode_project(b"non un progetto").is_err());
+    }
 }

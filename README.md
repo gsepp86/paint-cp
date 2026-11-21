@@ -3,7 +3,9 @@
 Paint CP è un programma di disegno e fotoritocco leggero, scritto in Rust, pensato per
 Windows ma funzionante anche su Linux e macOS. Serve per le piccole modifiche alle foto
 e per disegnare al volo con la semplicità del vecchio Paint, aggiungendo però gli
-strumenti che in Paint mancano: livelli, selezione, trasparenza e cronologia.
+strumenti che in Paint mancano: livelli, selezione, trasparenza e cronologia. I lavori
+si possono salvare come **progetto** con tutti i livelli, per riprenderli e modificarli
+anche in un secondo momento.
 
 È gratis, senza pubblicità e senza account: si scarica, si apre e si usa.
 
@@ -49,9 +51,16 @@ Scaricare l'ultima versione: <https://github.com/gsepp86/paint-cp/releases/lates
 - Rotazione di 90° a destra e a sinistra, capovolgimento orizzontale e verticale.
 - Inversione dei colori.
 
-### File
+### File e progetti
 
-- Apre **PNG, JPG/JPEG e BMP**, salva in **PNG, JPEG e BMP**.
+- Apre **PNG, JPG/JPEG e BMP**; salva l'immagine finale in **PNG, JPEG e BMP**.
+- **Salvataggio del progetto** in un file **`.pcp`**: conserva tutti i livelli con
+  nome, visibilità e opacità, più il livello attivo. Riaprendolo ritrovi il lavoro
+  com'era, pronto per altre modifiche.
+- Voci **File → Apri progetto...** e **File → Salva progetto...**; anche "Salva con
+  nome..." permette di scegliere il formato progetto.
+- Da un progetto puoi esportare un'immagine PNG/JPEG/BMP senza perdere i livelli: il
+  progetto resta il file di lavoro.
 - "Salva" e "Salva con nome", con il nome del file e l'asterisco di modifica non
   salvata nella barra del titolo.
 
@@ -117,6 +126,7 @@ Paint CP is a lightweight drawing and photo-editing app written in Rust for Wind
 Linux and macOS. It offers brush, pencil, eraser, spray, smudge, fill, color picker,
 text and shapes; rectangular selection with cut/copy/paste and crop; multiple layers
 with opacity and merge/flatten; new, resize, rotate and flip; PNG/JPEG/BMP open and
-save; undo/redo; zoom and ruler; Italian and English interface with light and dark
+save; **project files (`.pcp`) that keep every layer so you can reopen the work and edit
+it later**; undo/redo; zoom and ruler; Italian and English interface with light and dark
 themes; and a built-in "Check for updates" button in the Info dialog. Download the
 latest build from the releases page above.
