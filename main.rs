@@ -61,12 +61,11 @@ fn settings_path() -> Option<PathBuf> {
     base.map(|b| b.join(folder).join("settings.txt"))
 }
 
-/// Impostazioni salvate: lingua, tema e avvio massimizzato.
+/// Impostazioni salvate: lingua e tema.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Settings {
     lang: Lang,
     dark: bool,
-    maximized: bool,
 }
 
 impl Default for Settings {
@@ -74,7 +73,6 @@ impl Default for Settings {
         Self {
             lang: Lang::It,
             dark: false,
-            maximized: false,
         }
     }
 }
@@ -103,7 +101,6 @@ impl Settings {
                     };
                 }
                 "theme" => settings.dark = value.eq_ignore_ascii_case("dark"),
-                "maximized" => settings.maximized = matches!(value, "1" | "true" | "yes" | "si"),
                 _ => {}
             }
         }
@@ -123,11 +120,7 @@ impl Settings {
             Lang::En => "en",
         };
         let theme = if self.dark { "dark" } else { "light" };
-        let maximized = if self.maximized { 1 } else { 0 };
-        let _ = std::fs::write(
-            path,
-            format!("lang={lang}\ntheme={theme}\nmaximized={maximized}\n"),
-        );
+        let _ = std::fs::write(path, format!("lang={lang}\ntheme={theme}\n"));
     }
 }
 
@@ -335,8 +328,6 @@ struct PaintApp {
     zoom: f32,
     show_ruler: bool,
     dark: bool,
-    /// Apri la finestra sempre massimizzata (Impostazioni).
-    maximized: bool,
     /// Lingua dell'interfaccia (Impostazioni).
     lang: Lang,
 
@@ -1045,7 +1036,6 @@ impl PaintApp {
             zoom: 1.0,
             show_ruler: true,
             dark: settings.dark,
-            maximized: settings.maximized,
             lang,
             stroke: None,
             resize_drag: None,
@@ -2469,23 +2459,10 @@ impl PaintApp {
                         let dark_before = self.dark;
                         ui.radio_value(&mut self.dark, false, tr(self.lang, "Chiaro", "Light"));
                         ui.radio_value(&mut self.dark, true, tr(self.lang, "Scuro", "Dark"));
-                        ui.separator();
-                        let max_before = self.maximized;
-                        ui.checkbox(
-                            &mut self.maximized,
-                            tr(
-                                self.lang,
-                                "Apri sempre massimizzato",
-                                "Always open maximized",
-                            ),
-                        );
                         if self.dark != dark_before {
                             setup_style(ctx, self.dark);
                         }
-                        if self.lang != lang_before
-                            || self.dark != dark_before
-                            || self.maximized != max_before
-                        {
+                        if self.lang != lang_before || self.dark != dark_before {
                             self.save_settings();
                         }
                     });
@@ -3456,17 +3433,16 @@ impl PaintApp {
         }
     }
 
-    /// Salva lingua, tema e avvio massimizzato nelle impostazioni.
+    /// Salva lingua e tema nelle impostazioni.
     fn save_settings(&self) {
         Settings {
             lang: self.lang,
             dark: self.dark,
-            maximized: self.maximized,
         }
         .save();
     }
 
-    /// Finestra Impostazioni: lingua, tema e avvio massimizzato.
+    /// Finestra Impostazioni: lingua e tema.
     fn settings_dialog(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -3482,7 +3458,6 @@ impl PaintApp {
                 ui.add_space(4.0);
                 let lang_before = self.lang;
                 let dark_before = self.dark;
-                let max_before = self.maximized;
 
                 ui.strong(tr(self.lang, "Lingua", "Language"));
                 ui.radio_value(&mut self.lang, Lang::It, "Italiano");
@@ -3496,35 +3471,10 @@ impl PaintApp {
                 ui.radio_value(&mut self.dark, false, tr(self.lang, "Chiaro", "Light"));
                 ui.radio_value(&mut self.dark, true, tr(self.lang, "Scuro", "Dark"));
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                ui.checkbox(
-                    &mut self.maximized,
-                    tr(
-                        self.lang,
-                        "Apri sempre massimizzato",
-                        "Always open maximized",
-                    ),
-                );
-                ui.label(
-                    egui::RichText::new(tr(
-                        self.lang,
-                        "L'avvio massimizzato vale dal prossimo avvio.",
-                        "Maximized start applies from the next launch.",
-                    ))
-                    .weak()
-                    .small(),
-                );
-
                 if self.dark != dark_before {
                     setup_style(ctx, self.dark);
                 }
-                if self.lang != lang_before
-                    || self.dark != dark_before
-                    || self.maximized != max_before
-                {
+                if self.lang != lang_before || self.dark != dark_before {
                     self.save_settings();
                 }
             });
@@ -3646,22 +3596,17 @@ impl eframe::App for PaintApp {
 }
 
 fn main() -> eframe::Result<()> {
-    let settings = Settings::load();
+    // Finestra un po' piu' compatta, centrata sullo schermo all'avvio.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 800.0])
+        .with_inner_size([1152.0, 720.0])
         .with_min_inner_size([1040.0, 520.0])
         .with_title(format!("Senza titolo - {}", APP_NAME));
-    if settings.maximized {
-        // La finestra viene creata gia' massimizzata da winit, quindi appare a
-        // schermo intero senza il passaggio da finestra normale. Non va
-        // spostata fuori schermo: in quel caso restava invisibile.
-        viewport = viewport.with_maximized(true);
-    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
         viewport,
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
