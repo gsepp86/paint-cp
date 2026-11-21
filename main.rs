@@ -29,6 +29,10 @@ const APP_NAME: &str = "Paint CP";
 const APP_VERSION: &str = "1.3";
 const APP_DESCRIPTION: &str = "Paint CP è una app semplice per piccole modifiche alle foto in stile Paint di Windows, creato da Peppe CP con l'aiuto della IA.";
 const APP_DESCRIPTION_EN: &str = "Paint CP is a simple app for small edits to photos in the style of Windows Paint, made by Peppe CP with the help of AI.";
+/// Pagina da cui l'app controlla qual e' l'ultima versione pubblicata.
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/gsepp86/paint-cp/releases/latest";
+/// Pagina delle release aperta quando c'e' una versione nuova o il controllo fallisce.
+const RELEASES_URL: &str = "https://github.com/gsepp86/paint-cp/releases/latest";
 
 /// Lingua dell'interfaccia, scelta nella sezione Impostazioni.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,80 @@ fn tr(lang: Lang, it: &'static str, en: &'static str) -> &'static str {
         Lang::It => it,
         Lang::En => en,
     }
+}
+
+/// Esito del controllo aggiornamenti avviato dal riquadro Info.
+enum UpdateStatus {
+    /// L'ultima release pubblicata e' questa stessa versione.
+    UpToDate,
+    /// Esiste una release piu' recente (tag trovato su GitHub).
+    Newer(String),
+    /// Controllo non riuscito (rete assente, API non raggiungibile...).
+    Failed,
+}
+
+/// Estrae i numeri di una versione tipo "1.3" o "v1.4.1".
+fn version_parts(text: &str) -> Vec<u32> {
+    text.trim()
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+/// Vero se `remote` e' una versione piu' recente di `local`.
+fn is_newer(remote: &str, local: &str) -> bool {
+    let remote = version_parts(remote);
+    let local = version_parts(local);
+    for i in 0..remote.len().max(local.len()) {
+        let r = remote.get(i).copied().unwrap_or(0);
+        let l = local.get(i).copied().unwrap_or(0);
+        if r != l {
+            return r > l;
+        }
+    }
+    false
+}
+
+/// Chiede a GitHub qual e' il tag dell'ultima release pubblicata.
+///
+/// Usa il redirect di `releases/latest` (nessun limite di richieste) e solo se
+/// non basta interroga l'API delle release.
+fn fetch_latest_tag() -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirects(0)
+        .build();
+    if let Ok(response) = agent.get(RELEASES_URL).set("User-Agent", APP_NAME).call() {
+        let tag = response
+            .header("Location")
+            .and_then(|url| url.rsplit('/').next())
+            .map(str::trim)
+            .unwrap_or("");
+        if !tag.is_empty() {
+            return Ok(tag.to_string());
+        }
+    }
+    fetch_latest_tag_api()
+}
+
+/// Seconda strada per il controllo: API delle release di GitHub.
+fn fetch_latest_tag_api() -> Result<String, String> {
+    let response = ureq::get(LATEST_RELEASE_API)
+        .set("User-Agent", APP_NAME)
+        .set("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|e| e.to_string())?;
+    let body = response.into_string().map_err(|e| e.to_string())?;
+    let key = body.find("\"tag_name\"").ok_or("tag_name assente")?;
+    let rest = &body[key + "\"tag_name\"".len()..];
+    let colon = rest.find(':').ok_or("risposta non valida")?;
+    let rest = &rest[colon + 1..];
+    let start = rest.find('"').ok_or("risposta non valida")? + 1;
+    let rest = &rest[start..];
+    let end = rest.find('"').ok_or("risposta non valida")?;
+    Ok(rest[..end].to_string())
 }
 
 /// File di configurazione con le impostazioni salvate (per ora la lingua).
@@ -344,6 +422,10 @@ struct PaintApp {
     new_dialog: Option<(u32, u32)>,
     resize_dialog: Option<ResizeDialog>,
     about_open: bool,
+    /// Controllo aggiornamenti in corso: il thread manda qui il tag trovato.
+    update_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Ultimo esito del controllo aggiornamenti.
+    update_status: Option<UpdateStatus>,
     settings_open: bool,
     status: String,
     last_title: String,
@@ -1049,6 +1131,8 @@ impl PaintApp {
             new_dialog: None,
             resize_dialog: None,
             about_open: false,
+            update_rx: None,
+            update_status: None,
             settings_open: false,
             status: String::from(tr(lang, "Pronto", "Ready")),
             last_title: String::new(),
@@ -3487,6 +3571,27 @@ impl PaintApp {
         if !self.about_open {
             return;
         }
+        // Ritira l'esito del controllo aggiornamenti lanciato in background.
+        let received = self.update_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(tag))) => {
+                self.update_rx = None;
+                self.update_status = Some(if is_newer(&tag, APP_VERSION) {
+                    UpdateStatus::Newer(tag)
+                } else {
+                    UpdateStatus::UpToDate
+                });
+            }
+            Some(Ok(Err(_))) | Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.update_rx = None;
+                self.update_status = Some(UpdateStatus::Failed);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                // Il thread sta ancora lavorando: ridisegna finche' non risponde.
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            None => {}
+        }
         let mut open = true;
         let mut close_clicked = false;
         egui::Window::new(format!(
@@ -3521,6 +3626,78 @@ impl PaintApp {
             ui.label(tr(self.lang, APP_DESCRIPTION, APP_DESCRIPTION_EN));
             ui.add_space(10.0);
             ui.separator();
+            ui.add_space(6.0);
+
+            // Controllo aggiornamenti: la richiesta a GitHub gira in un thread
+            // separato, cosi' la finestra resta reattiva anche se la rete e' lenta.
+            let checking = self.update_rx.is_some();
+            if ui
+                .add_enabled(
+                    !checking,
+                    egui::Button::new(if checking {
+                        tr(self.lang, "Controllo in corso...", "Checking...")
+                    } else {
+                        tr(self.lang, "Controlla aggiornamenti", "Check for updates")
+                    }),
+                )
+                .clicked()
+            {
+                self.update_status = None;
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.update_rx = Some(rx);
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(fetch_latest_tag());
+                    ctx.request_repaint();
+                });
+            }
+            match &self.update_status {
+                Some(UpdateStatus::UpToDate) => {
+                    ui.label(tr(
+                        self.lang,
+                        "Stai usando la versione piu' recente.",
+                        "You are using the latest version.",
+                    ));
+                }
+                Some(UpdateStatus::Newer(tag)) => {
+                    ui.label(tr(
+                        self.lang,
+                        "E' disponibile una nuova versione:",
+                        "A new version is available:",
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.strong(tag);
+                        if ui
+                            .button(tr(self.lang, "Apri il download", "Open download page"))
+                            .on_hover_text(RELEASES_URL)
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(RELEASES_URL));
+                        }
+                    });
+                }
+                Some(UpdateStatus::Failed) => {
+                    ui.label(tr(
+                        self.lang,
+                        "Controllo non riuscito: verifica la connessione a Internet.",
+                        "Check failed: please verify your Internet connection.",
+                    ));
+                    if ui
+                        .button(tr(
+                            self.lang,
+                            "Apri la pagina delle release",
+                            "Open the releases page",
+                        ))
+                        .on_hover_text(RELEASES_URL)
+                        .clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl::new_tab(RELEASES_URL));
+                    }
+                }
+                None => {}
+            }
+            ui.add_space(10.0);
+            ui.separator();
             ui.add_space(8.0);
             ui.label(tr(
                 self.lang,
@@ -3547,7 +3724,11 @@ impl PaintApp {
             }
         });
         if !open || close_clicked {
+            // Chiudendo la finestra il controllo in corso viene buttato via, cosi'
+            // riaprendola il tasto e' subito di nuovo disponibile.
             self.about_open = false;
+            self.update_rx = None;
+            self.update_status = None;
         }
     }
 
