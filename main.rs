@@ -423,6 +423,8 @@ struct PaintApp {
     new_dialog: Option<(u32, u32)>,
     resize_dialog: Option<ResizeDialog>,
     about_open: bool,
+    /// Vero quando la finestra e' stata chiusa con modifiche da salvare.
+    confirm_close: bool,
     /// Controllo aggiornamenti in corso: il thread manda qui il tag trovato.
     update_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Ultimo esito del controllo aggiornamenti.
@@ -1275,6 +1277,7 @@ impl PaintApp {
             new_dialog: None,
             resize_dialog: None,
             about_open: false,
+            confirm_close: false,
             update_rx: None,
             update_status: None,
             settings_open: false,
@@ -4038,6 +4041,60 @@ impl PaintApp {
         }
     }
 
+    /// Chiede se salvare le modifiche prima di chiudere il programma.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let mut save_clicked = false;
+        let mut discard_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Window::new(tr(self.lang, "Chiudere Paint CP?", "Close Paint CP?"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.add_space(4.0);
+                ui.label(tr(
+                    self.lang,
+                    "Ci sono modifiche non salvate. Vuoi salvarle prima di chiudere?",
+                    "There are unsaved changes. Do you want to save them before closing?",
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr(self.lang, "Salva", "Save")).clicked() {
+                        save_clicked = true;
+                    }
+                    if ui
+                        .button(tr(self.lang, "Non salvare", "Don't save"))
+                        .clicked()
+                    {
+                        discard_clicked = true;
+                    }
+                    if ui.button(tr(self.lang, "Annulla", "Cancel")).clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if save_clicked {
+            self.save();
+            // Se il salvataggio e' andato a buon fine (o l'utente ha annullato la
+            // finestra di salvataggio) si chiude solo quando non resta nulla da salvare.
+            if !self.modified {
+                self.confirm_close = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if discard_clicked {
+            self.modified = false;
+            self.confirm_close = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel_clicked {
+            self.confirm_close = false;
+        }
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let name = self
             .file_path
@@ -4060,6 +4117,15 @@ impl PaintApp {
 
 impl eframe::App for PaintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Prima di chiudere, se il lavoro non e' salvato si annulla la chiusura e
+        // si chiede all'utente cosa fare.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.modified || self.text_edit.is_some())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+
         self.handle_shortcuts(ctx);
         self.menu_bar(ctx);
         self.toolbar(ctx);
@@ -4075,6 +4141,7 @@ impl eframe::App for PaintApp {
         self.resize_dialog_ui(ctx);
         self.settings_dialog(ctx);
         self.about_dialog(ctx);
+        self.close_dialog(ctx);
         self.render_text();
         self.layers_panel(ctx);
         self.canvas_panel(ctx);

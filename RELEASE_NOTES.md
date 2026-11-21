@@ -52,11 +52,15 @@ modificarlo quando vuoi.
 - Interfaccia in italiano e in inglese, tema chiaro e scuro, scelte ricordate tra un avvio
   e l'altro
 - Finestra iniziale compatta, centrata sullo schermo
+- **Chiusura sicura**: se ci sono modifiche non salvate, prima di chiudere l'app chiede
+  se salvare, non salvare o annullare
 - Sezione Info con il tasto **Controlla aggiornamenti**: interroga GitHub e dice se è
   uscita una versione nuova, con il collegamento diretto al download
 
 ### Novità di questa versione
 
+- **Chiusura protetta**: se il lavoro ha modifiche non salvate, chiudendo l'app compare
+  una finestra che chiede se salvare, non salvare o annullare.
 - **Salvataggio del progetto**: oltre all'immagine, si può salvare il lavoro in un file
   `.pcp` con tutti i livelli (nome, visibilità, opacità) e riaprirlo in seguito per
   continuare a modificarlo.

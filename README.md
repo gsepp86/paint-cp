@@ -71,6 +71,8 @@ Scaricare l'ultima versione: <https://github.com/gsepp86/paint-cp/releases/lates
 - **Interfaccia in italiano e in inglese**, tema **chiaro** e **scuro**, scelte
   ricordate tra un avvio e l'altro.
 - Finestra iniziale compatta, centrata sullo schermo, con dimensione minima garantita.
+- **Chiusura sicura**: se ci sono modifiche non salvate, prima di chiudere l'app chiede
+  se salvare, non salvare o annullare.
 - **Controllo aggiornamenti** nella sezione Info: un tasto interroga GitHub e dice se
   è uscita una versione nuova, con il collegamento diretto al download.
 
